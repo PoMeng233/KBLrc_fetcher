@@ -1,0 +1,1135 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Callable, Optional
+
+import requests
+from mutagen import File as MutagenFile
+
+VERSION = "2.0.0"
+USER_AGENT = f"LyricsFetcher/{VERSION} (+local script)"
+
+AUDIO_EXTENSIONS = {
+    ".mp3",
+    ".flac",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".wma",
+    ".ape",
+    ".mp4",
+}
+
+SOURCE_PRIORITY = {
+    "kugou": 40,
+    "qq": 35,
+    "netease": 30,
+    "lrclib": 25,
+}
+
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+    }
+)
+
+
+@dataclass
+class TrackQuery:
+    title: str
+    artist: str = ""
+    album: str = ""
+    duration: Optional[int] = None
+    source_file: Optional[Path] = None
+    search_variants: list[tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class LyricsCandidate:
+    source: str
+    title: str = ""
+    artist: str = ""
+    album: str = ""
+    duration: Optional[int] = None
+    synced_lyrics: str = ""
+    plain_lyrics: str = ""
+    translated_lyrics: str = ""
+    score: float = 0.0
+    extra: dict = field(default_factory=dict)
+
+    @property
+    def has_synced(self) -> bool:
+        return bool(
+            self.synced_lyrics
+            and re.search(r"^\[\d{2}:\d{2}(?:\.\d{1,3})?\]", self.synced_lyrics, re.M)
+        )
+
+    @property
+    def has_plain(self) -> bool:
+        return bool((self.plain_lyrics or "").strip())
+
+    @property
+    def has_any(self) -> bool:
+        return bool(
+            (self.synced_lyrics or "").strip()
+            or (self.plain_lyrics or "").strip()
+            or (self.translated_lyrics or "").strip()
+        )
+
+
+@dataclass
+class SaveOptions:
+    output_mode: str = "file"
+    overwrite: bool = False
+    out_dir: Optional[Path] = None
+    lyric_mode: str = "auto"  # auto | synced | plain
+    include_metadata: bool = True
+    strip_timestamps: bool = False
+
+
+@dataclass
+class ProcessResult:
+    query: TrackQuery
+    success: bool
+    message: str
+    candidate: Optional[LyricsCandidate] = None
+    output_path: Optional[Path] = None
+    candidates: list[LyricsCandidate] = field(default_factory=list)
+
+
+Logger = Optional[Callable[[str], None]]
+
+
+def default_logger(message: str) -> None:
+    print(message)
+
+
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*]', "_", (name or "")).strip()
+    name = re.sub(r"\s+", " ", name)
+    return name[:180] or "lyrics"
+
+
+def normalize_text(text: str) -> str:
+    text = (text or "").strip().lower()
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(r"\[[^\]]*\]", " ", text)
+    text = re.sub(r"[^\w\u4e00-\u9fff\u3040-\u30ff]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def similarity(a: str, b: str) -> float:
+    a = normalize_text(a)
+    b = normalize_text(b)
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def safe_json_from_jsonp(text: str):
+    text = text.strip()
+    if text.startswith("{") or text.startswith("["):
+        return json.loads(text)
+    match = re.search(r"^[^(]+\((.*)\)\s*;?\s*$", text, re.S)
+    if match:
+        return json.loads(match.group(1))
+    raise ValueError("Unable to parse JSON/JSONP response")
+
+
+def first_tag(tags: dict, *keys: str) -> str:
+    for key in keys:
+        value = tags.get(key)
+        if isinstance(value, list) and value:
+            return str(value[0]).strip()
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def parse_filename_variants(stem: str) -> list[tuple[str, str]]:
+    stem = stem.strip()
+    variants: list[tuple[str, str]] = [(stem, "")]
+    separators = [" - ", " — ", " – ", "-", "—", "–"]
+
+    for sep in separators:
+        if sep in stem:
+            left, right = stem.split(sep, 1)
+            left = left.strip()
+            right = right.strip()
+            if left and right:
+                variants.append((right, left))
+                variants.append((left, right))
+                break
+
+    dedup: list[tuple[str, str]] = []
+    seen = set()
+    for title, artist in variants:
+        key = (title.strip().lower(), artist.strip().lower())
+        if key not in seen:
+            dedup.append((title, artist))
+            seen.add(key)
+    return dedup
+
+
+def read_audio_metadata(path: Path) -> TrackQuery:
+    title = ""
+    artist = ""
+    album = ""
+    duration = None
+
+    try:
+        audio = MutagenFile(path, easy=True)
+        if audio:
+            tags = dict(audio.tags or {})
+            title = first_tag(tags, "title")
+            artist = first_tag(tags, "artist", "albumartist")
+            album = first_tag(tags, "album")
+            info = getattr(audio, "info", None)
+            if info and getattr(info, "length", None):
+                duration = int(round(info.length))
+    except Exception:
+        pass
+
+    if not title:
+        title = path.stem
+
+    variants = parse_filename_variants(path.stem)
+    if artist and title:
+        variants.insert(0, (title, artist))
+
+    dedup: list[tuple[str, str]] = []
+    seen = set()
+    for t, a in variants:
+        key = (t.strip().lower(), a.strip().lower())
+        if key not in seen:
+            dedup.append((t, a))
+            seen.add(key)
+
+    return TrackQuery(
+        title=title.strip(),
+        artist=artist.strip(),
+        album=album.strip(),
+        duration=duration,
+        source_file=path,
+        search_variants=dedup,
+    )
+
+
+def build_manual_query(
+    title: str,
+    artist: str = "",
+    album: str = "",
+    duration: Optional[int] = None,
+) -> TrackQuery:
+    title = title.strip()
+    artist = artist.strip()
+    variants = [(title, artist)]
+    if not artist:
+        variants.extend(parse_filename_variants(title))
+
+    dedup: list[tuple[str, str]] = []
+    seen = set()
+    for t, a in variants:
+        key = (t.strip().lower(), a.strip().lower())
+        if key not in seen:
+            dedup.append((t, a))
+            seen.add(key)
+
+    return TrackQuery(
+        title=title,
+        artist=artist,
+        album=album.strip(),
+        duration=duration,
+        source_file=None,
+        search_variants=dedup,
+    )
+
+
+def try_request(method: str, url: str, *, timeout: int = 12, **kwargs):
+    response = SESSION.request(method, url, timeout=timeout, **kwargs)
+    response.raise_for_status()
+    return response
+
+
+def score_candidate(query: TrackQuery, cand: LyricsCandidate) -> float:
+    score = SOURCE_PRIORITY.get(cand.source, 0)
+    score += 100 if cand.has_synced else 10
+
+    if query.title:
+        score += similarity(query.title, cand.title or query.title) * 40
+    if query.artist:
+        score += similarity(query.artist, cand.artist or query.artist) * 25
+    if query.album and cand.album:
+        score += similarity(query.album, cand.album) * 10
+
+    if query.duration and cand.duration:
+        diff = abs(query.duration - cand.duration)
+        if diff <= 2:
+            score += 15
+        elif diff <= 5:
+            score += 8
+        elif diff <= 12:
+            score += 3
+
+    return score
+
+
+def is_timestamped_lyric(text: str) -> bool:
+    return bool(re.search(r"^\[\d{2}:\d{2}(?:\.\d{1,3})?\]", text or "", re.M))
+
+
+def remove_lrc_timestamps(text: str) -> str:
+    lines = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip("\ufeff")
+        line = re.sub(r"^\[(?:ar|ti|al|by|offset):.*?\]\s*$", "", line, flags=re.I)
+        line = re.sub(r"(?:\[\d{2}:\d{2}(?:\.\d{1,3})?\])+", "", line).strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def clean_plain_lyrics(text: str) -> str:
+    lines = [line.rstrip() for line in (text or "").splitlines()]
+    lines = [line for line in lines if line.strip()]
+    return "\n".join(lines)
+
+
+def candidate_best_text(candidate: LyricsCandidate, lyric_mode: str) -> str:
+    lyric_mode = (lyric_mode or "auto").lower()
+
+    if lyric_mode == "synced":
+        return (candidate.synced_lyrics or "").strip()
+
+    if lyric_mode == "plain":
+        if candidate.plain_lyrics.strip():
+            return clean_plain_lyrics(candidate.plain_lyrics)
+        return remove_lrc_timestamps(candidate.synced_lyrics)
+
+    if candidate.has_synced:
+        return (candidate.synced_lyrics or "").strip()
+    if candidate.plain_lyrics.strip():
+        return clean_plain_lyrics(candidate.plain_lyrics)
+    return remove_lrc_timestamps(candidate.synced_lyrics)
+
+
+def render_lrc(
+    candidate: LyricsCandidate,
+    *,
+    lyric_mode: str = "auto",
+    include_metadata: bool = True,
+    strip_timestamps: bool = False,
+) -> str:
+    body = candidate_best_text(candidate, lyric_mode)
+
+    if strip_timestamps and body:
+        body = remove_lrc_timestamps(body)
+
+    body = clean_plain_lyrics(body) if not is_timestamped_lyric(body) else body.strip()
+
+    header: list[str] = []
+    if include_metadata:
+        if candidate.title:
+            header.append(f"[ti:{candidate.title}]")
+        if candidate.artist:
+            header.append(f"[ar:{candidate.artist}]")
+        if candidate.album:
+            header.append(f"[al:{candidate.album}]")
+        header.append("[by:lyrics_fetcher]")
+
+    if header:
+        return "\n".join(header + [""] + body.splitlines()) + "\n"
+    return body.strip() + ("\n" if body.strip() else "")
+
+
+def choose_output_filename(
+    candidate: LyricsCandidate,
+    query: TrackQuery,
+    output_mode: str,
+) -> str:
+    if query.source_file and output_mode == "file":
+        return f"{query.source_file.stem}.lrc"
+
+    title = (
+        candidate.title
+        or query.title
+        or (query.source_file.stem if query.source_file else "lyrics")
+    )
+    artist = candidate.artist or query.artist
+
+    if output_mode == "title-artist" and artist:
+        return f"{sanitize_filename(title)} - {sanitize_filename(artist)}.lrc"
+    if output_mode == "title-artist":
+        return f"{sanitize_filename(title)}.lrc"
+
+    if query.source_file:
+        return f"{query.source_file.stem}.lrc"
+    if artist:
+        return f"{sanitize_filename(title)} - {sanitize_filename(artist)}.lrc"
+    return f"{sanitize_filename(title)}.lrc"
+
+
+def save_lyrics(
+    candidate: LyricsCandidate,
+    query: TrackQuery,
+    options: SaveOptions,
+) -> Path:
+    if query.source_file:
+        song_dir = query.source_file.parent
+    else:
+        song_dir = Path.cwd()
+
+    target_dir = options.out_dir or song_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = choose_output_filename(candidate, query, options.output_mode)
+    out_path = target_dir / filename
+
+    if out_path.exists() and not options.overwrite:
+        raise FileExistsError(f"文件已存在: {out_path}")
+
+    content = render_lrc(
+        candidate,
+        lyric_mode=options.lyric_mode,
+        include_metadata=options.include_metadata,
+        strip_timestamps=options.strip_timestamps,
+    )
+    out_path.write_text(content, encoding="utf-8-sig")
+    return out_path
+
+
+def search_lrclib(query: TrackQuery) -> list[LyricsCandidate]:
+    results: list[LyricsCandidate] = []
+
+    if query.title and query.artist and query.album and query.duration:
+        try:
+            response = try_request(
+                "GET",
+                "https://lrclib.net/api/get",
+                params={
+                    "track_name": query.title,
+                    "artist_name": query.artist,
+                    "album_name": query.album,
+                    "duration": query.duration,
+                },
+                headers={"User-Agent": USER_AGENT},
+            )
+            data = response.json()
+            results.append(
+                LyricsCandidate(
+                    source="lrclib",
+                    title=data.get("trackName", ""),
+                    artist=data.get("artistName", ""),
+                    album=data.get("albumName", ""),
+                    duration=data.get("duration"),
+                    synced_lyrics=data.get("syncedLyrics", "") or "",
+                    plain_lyrics=data.get("plainLyrics", "") or "",
+                )
+            )
+        except Exception:
+            pass
+
+    for title, artist in query.search_variants:
+        try:
+            response = try_request(
+                "GET",
+                "https://lrclib.net/api/search",
+                params={
+                    "track_name": title,
+                    "artist_name": artist,
+                    "album_name": query.album,
+                },
+                headers={"User-Agent": USER_AGENT},
+            )
+            data = response.json()
+            if isinstance(data, list):
+                for item in data[:6]:
+                    results.append(
+                        LyricsCandidate(
+                            source="lrclib",
+                            title=item.get("trackName", ""),
+                            artist=item.get("artistName", ""),
+                            album=item.get("albumName", ""),
+                            duration=item.get("duration"),
+                            synced_lyrics=item.get("syncedLyrics", "") or "",
+                            plain_lyrics=item.get("plainLyrics", "") or "",
+                        )
+                    )
+        except Exception:
+            continue
+
+    return [item for item in results if item.has_any]
+
+
+def search_kugou(query: TrackQuery) -> list[LyricsCandidate]:
+    results: list[LyricsCandidate] = []
+
+    for title, artist in query.search_variants:
+        keyword = f"{artist} - {title}".strip(" -")
+        if not keyword:
+            continue
+
+        try:
+            response = try_request(
+                "GET",
+                "https://mobilecdn.kugou.com/api/v3/search/song",
+                params={
+                    "format": "json",
+                    "keyword": keyword,
+                    "page": 1,
+                    "pagesize": 8,
+                    "showtype": 1,
+                },
+                headers={"Referer": "https://www.kugou.com/", "User-Agent": USER_AGENT},
+            )
+            data = response.json()
+            songs = (((data or {}).get("data") or {}).get("info") or [])[:5]
+
+            for song in songs:
+                song_hash = (
+                    song.get("hash") or song.get("320hash") or song.get("sqhash")
+                )
+                if not song_hash:
+                    continue
+
+                duration_ms = ""
+                if song.get("duration"):
+                    try:
+                        duration_ms = int(song["duration"]) * 1000
+                    except Exception:
+                        duration_ms = ""
+
+                candidate_response = try_request(
+                    "GET",
+                    "https://krcs.kugou.com/search",
+                    params={
+                        "ver": 1,
+                        "man": "yes",
+                        "client": "mobi",
+                        "keyword": "",
+                        "duration": duration_ms,
+                        "hash": song_hash,
+                        "album_audio_id": "",
+                    },
+                    headers={
+                        "Referer": "https://www.kugou.com/",
+                        "User-Agent": USER_AGENT,
+                    },
+                )
+                candidate_data = candidate_response.json()
+                candidates = (candidate_data or {}).get("candidates") or []
+                if not candidates:
+                    continue
+
+                item = candidates[0]
+                lyric_response = try_request(
+                    "GET",
+                    "https://lyrics.kugou.com/download",
+                    params={
+                        "ver": 1,
+                        "client": "pc",
+                        "id": item.get("id"),
+                        "accesskey": item.get("accesskey"),
+                        "fmt": "lrc",
+                        "charset": "utf8",
+                    },
+                    headers={
+                        "Referer": "https://www.kugou.com/",
+                        "User-Agent": USER_AGENT,
+                    },
+                )
+                lyric_data = lyric_response.json()
+                content = lyric_data.get("content", "")
+                if not content:
+                    continue
+
+                try:
+                    decoded = base64.b64decode(content).decode("utf-8", errors="ignore")
+                except Exception:
+                    decoded = content
+
+                results.append(
+                    LyricsCandidate(
+                        source="kugou",
+                        title=song.get("songname") or title,
+                        artist=song.get("singername") or artist,
+                        album=song.get("album_name") or "",
+                        duration=int(song.get("duration"))
+                        if song.get("duration")
+                        else None,
+                        synced_lyrics=decoded,
+                        plain_lyrics=remove_lrc_timestamps(decoded),
+                    )
+                )
+        except Exception:
+            continue
+
+    return [item for item in results if item.has_any]
+
+
+def search_netease(query: TrackQuery) -> list[LyricsCandidate]:
+    results: list[LyricsCandidate] = []
+    headers = {"Referer": "https://music.163.com/", "User-Agent": USER_AGENT}
+
+    for title, artist in query.search_variants:
+        keyword = f"{title} {artist}".strip()
+        if not keyword:
+            continue
+
+        try:
+            response = try_request(
+                "GET",
+                "https://music.163.com/api/search/get/web",
+                params={
+                    "s": keyword,
+                    "type": 1,
+                    "offset": 0,
+                    "limit": 8,
+                },
+                headers=headers,
+            )
+            data = response.json()
+            songs = (((data or {}).get("result") or {}).get("songs") or [])[:5]
+
+            for song in songs:
+                song_id = song.get("id")
+                if not song_id:
+                    continue
+
+                lyric_response = try_request(
+                    "GET",
+                    "https://music.163.com/api/song/lyric",
+                    params={
+                        "id": song_id,
+                        "lv": -1,
+                        "kv": -1,
+                        "tv": -1,
+                    },
+                    headers=headers,
+                )
+                lyric_data = lyric_response.json()
+                lrc = (((lyric_data or {}).get("lrc") or {}).get("lyric")) or ""
+                tlyric = (((lyric_data or {}).get("tlyric") or {}).get("lyric")) or ""
+                if not lrc and not tlyric:
+                    continue
+
+                artists = ", ".join(
+                    item.get("name", "")
+                    for item in song.get("artists", [])
+                    if item.get("name")
+                )
+                album = ((song.get("album") or {}).get("name")) or ""
+                duration = (
+                    int(round((song.get("duration") or 0) / 1000))
+                    if song.get("duration")
+                    else None
+                )
+
+                results.append(
+                    LyricsCandidate(
+                        source="netease",
+                        title=song.get("name") or title,
+                        artist=artists or artist,
+                        album=album,
+                        duration=duration,
+                        synced_lyrics=lrc,
+                        translated_lyrics=tlyric,
+                        plain_lyrics=remove_lrc_timestamps(lrc)
+                        if lrc
+                        else clean_plain_lyrics(tlyric),
+                    )
+                )
+        except Exception:
+            continue
+
+    return [item for item in results if item.has_any]
+
+
+def search_qq(query: TrackQuery) -> list[LyricsCandidate]:
+    results: list[LyricsCandidate] = []
+    headers = {"Referer": "https://y.qq.com/", "User-Agent": USER_AGENT}
+
+    for title, artist in query.search_variants:
+        keyword = f"{title} {artist}".strip()
+        if not keyword:
+            continue
+
+        try:
+            response = try_request(
+                "GET",
+                "https://c.y.qq.com/soso/fcgi-bin/client_search_cp",
+                params={
+                    "ct": 24,
+                    "qqmusic_ver": 1298,
+                    "new_json": 1,
+                    "remoteplace": "txt.yqq.song",
+                    "searchid": 0,
+                    "t": 0,
+                    "aggr": 1,
+                    "cr": 1,
+                    "catZhida": 1,
+                    "lossless": 0,
+                    "flag_qc": 0,
+                    "p": 1,
+                    "n": 8,
+                    "w": keyword,
+                    "g_tk": 5381,
+                    "format": "json",
+                    "inCharset": "utf8",
+                    "outCharset": "utf-8",
+                    "notice": 0,
+                    "platform": "yqq.json",
+                    "needNewCode": 0,
+                },
+                headers=headers,
+            )
+            data = safe_json_from_jsonp(response.text)
+            songs = (
+                (((data or {}).get("data") or {}).get("song") or {}).get("list") or []
+            )[:5]
+
+            for song in songs:
+                songmid = song.get("mid") or song.get("songmid")
+                if not songmid:
+                    continue
+
+                lyric_response = try_request(
+                    "GET",
+                    "https://i.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg",
+                    params={
+                        "songmid": songmid,
+                        "format": "json",
+                        "nobase64": 1,
+                        "g_tk": 5381,
+                        "inCharset": "utf-8",
+                        "outCharset": "utf-8",
+                        "notice": 0,
+                        "platform": "yqq.json",
+                        "needNewCode": 0,
+                    },
+                    headers=headers,
+                )
+                lyric_data = safe_json_from_jsonp(lyric_response.text)
+                lrc = lyric_data.get("lyric", "") or ""
+                trans = lyric_data.get("trans", "") or ""
+                if not lrc and not trans:
+                    continue
+
+                singers = ", ".join(
+                    item.get("name", "")
+                    for item in song.get("singer", [])
+                    if item.get("name")
+                )
+                album = (
+                    (song.get("album") or {}).get("name", "")
+                    if isinstance(song.get("album"), dict)
+                    else ""
+                )
+                interval = song.get("interval")
+                duration = int(interval) if interval else None
+
+                results.append(
+                    LyricsCandidate(
+                        source="qq",
+                        title=song.get("title") or title,
+                        artist=singers or artist,
+                        album=album,
+                        duration=duration,
+                        synced_lyrics=lrc,
+                        translated_lyrics=trans,
+                        plain_lyrics=remove_lrc_timestamps(lrc)
+                        if lrc
+                        else clean_plain_lyrics(trans),
+                    )
+                )
+        except Exception:
+            continue
+
+    return [item for item in results if item.has_any]
+
+
+PROVIDER_FUNCS: dict[str, Callable[[TrackQuery], list[LyricsCandidate]]] = {
+    "lrclib": search_lrclib,
+    "kugou": search_kugou,
+    "netease": search_netease,
+    "qq": search_qq,
+}
+
+
+def collect_candidates(
+    query: TrackQuery,
+    providers: list[str],
+    logger: Logger = None,
+) -> list[LyricsCandidate]:
+    log = logger or (lambda _: None)
+    candidates: list[LyricsCandidate] = []
+
+    for provider in providers:
+        func = PROVIDER_FUNCS.get(provider)
+        if not func:
+            log(f"[WARN] 未知歌词源: {provider}")
+            continue
+
+        log(f"[INFO] 搜索 {provider}: {query.title} / {query.artist}")
+        try:
+            items = func(query)
+            for item in items:
+                item.score = score_candidate(query, item)
+                candidates.append(item)
+            log(f"[INFO] {provider} 返回 {len(items)} 条结果")
+        except Exception as exc:
+            log(f"[WARN] {provider} 搜索失败: {exc}")
+
+    candidates.sort(key=lambda item: item.score, reverse=True)
+    return candidates
+
+
+def choose_best_candidate(
+    query: TrackQuery,
+    providers: list[str],
+    prefer_synced: bool = True,
+    logger: Logger = None,
+) -> tuple[Optional[LyricsCandidate], list[LyricsCandidate]]:
+    candidates = collect_candidates(query, providers, logger=logger)
+    if not candidates:
+        return None, []
+
+    if prefer_synced:
+        synced = [item for item in candidates if item.has_synced]
+        if synced:
+            synced.sort(key=lambda item: item.score, reverse=True)
+            return synced[0], candidates
+
+    return candidates[0], candidates
+
+
+def find_audio_files(path: Path, recursive: bool = True) -> list[Path]:
+    if path.is_file():
+        return [path] if path.suffix.lower() in AUDIO_EXTENSIONS else []
+    globber = path.rglob if recursive else path.glob
+    return sorted(
+        item
+        for item in globber("*")
+        if item.is_file() and item.suffix.lower() in AUDIO_EXTENSIONS
+    )
+
+
+def process_query(
+    query: TrackQuery,
+    providers: list[str],
+    save_options: SaveOptions,
+    logger: Logger = None,
+) -> ProcessResult:
+    log = logger or (lambda _: None)
+    prefer_synced = (
+        save_options.lyric_mode != "plain" and not save_options.strip_timestamps
+    )
+    best, candidates = choose_best_candidate(
+        query,
+        providers,
+        prefer_synced=prefer_synced,
+        logger=logger,
+    )
+
+    if not best:
+        return ProcessResult(
+            query=query,
+            success=False,
+            message=f"未找到歌词: {query.title} - {query.artist}",
+            candidates=[],
+        )
+
+    log(
+        f"[OK] 选中来源: {best.source} | {best.title} - {best.artist} | "
+        f"synced={best.has_synced}"
+    )
+
+    try:
+        output_path = save_lyrics(best, query, save_options)
+    except FileExistsError as exc:
+        return ProcessResult(
+            query=query,
+            success=False,
+            message=str(exc),
+            candidate=best,
+            candidates=candidates,
+        )
+    except Exception as exc:
+        return ProcessResult(
+            query=query,
+            success=False,
+            message=f"保存失败: {exc}",
+            candidate=best,
+            candidates=candidates,
+        )
+
+    return ProcessResult(
+        query=query,
+        success=True,
+        message=f"已保存: {output_path}",
+        candidate=best,
+        output_path=output_path,
+        candidates=candidates,
+    )
+
+
+def process_file(
+    file_path: Path,
+    providers: list[str],
+    save_options: SaveOptions,
+    logger: Logger = None,
+) -> ProcessResult:
+    query = read_audio_metadata(file_path)
+    return process_query(query, providers, save_options, logger=logger)
+
+
+def process_directory(
+    directory: Path,
+    providers: list[str],
+    save_options: SaveOptions,
+    *,
+    recursive: bool = True,
+    logger: Logger = None,
+) -> list[ProcessResult]:
+    files = find_audio_files(directory, recursive=recursive)
+    results: list[ProcessResult] = []
+
+    for index, file_path in enumerate(files, start=1):
+        if logger:
+            logger(f"\n=== [{index}/{len(files)}] 处理: {file_path.name} ===")
+        results.append(process_file(file_path, providers, save_options, logger=logger))
+
+    return results
+
+
+def parse_provider_list(raw: str) -> list[str]:
+    providers = [
+        item.strip().lower() for item in (raw or "").split(",") if item.strip()
+    ]
+    return providers or ["lrclib", "kugou", "netease", "qq"]
+
+
+def build_save_options_from_args(args: argparse.Namespace) -> SaveOptions:
+    lyric_mode = args.lyric_mode
+    strip_timestamps = bool(args.strip_timestamps)
+
+    if args.unsynced_only:
+        lyric_mode = "plain"
+        strip_timestamps = True
+
+    out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else None
+
+    return SaveOptions(
+        output_mode=args.name_format,
+        overwrite=args.overwrite,
+        out_dir=out_dir,
+        lyric_mode=lyric_mode,
+        include_metadata=not args.no_metadata,
+        strip_timestamps=strip_timestamps,
+    )
+
+
+def create_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="自动搜索歌词并保存为 LRC")
+    parser.add_argument("--title", help="歌曲名")
+    parser.add_argument("--artist", default="", help="歌手名")
+    parser.add_argument("--album", default="", help="专辑名")
+    parser.add_argument("--duration", type=int, default=None, help="时长(秒)")
+    parser.add_argument("--file", help="单个音频文件路径")
+    parser.add_argument("--dir", help="批量处理文件夹")
+    parser.add_argument(
+        "--providers",
+        default="lrclib,kugou,netease,qq",
+        help="歌词源，逗号分隔",
+    )
+    parser.add_argument(
+        "--name-format",
+        choices=["file", "title-artist"],
+        default="file",
+        help="输出文件名格式",
+    )
+    parser.add_argument("--overwrite", action="store_true", help="覆盖已存在的 LRC")
+    parser.add_argument("--out-dir", help="指定输出目录；默认保存到歌曲所在目录")
+    parser.add_argument(
+        "--non-recursive",
+        action="store_true",
+        help="文件夹模式下不递归子目录",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="只搜索不保存")
+    parser.add_argument(
+        "--lyric-mode",
+        choices=["auto", "synced", "plain"],
+        default="auto",
+        help="歌词保存模式：自动/仅时间轴/仅纯文本",
+    )
+    parser.add_argument(
+        "--strip-timestamps",
+        action="store_true",
+        help="保存前去掉时间戳",
+    )
+    parser.add_argument(
+        "--unsynced-only",
+        action="store_true",
+        help="等价于 --lyric-mode plain --strip-timestamps",
+    )
+    parser.add_argument(
+        "--no-metadata",
+        action="store_true",
+        help="不写入 [ti]/[ar]/[al]/[by] 头信息",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+    )
+    return parser
+
+
+def cli_print_result(result: ProcessResult) -> None:
+    prefix = "[OK]" if result.success else "[FAIL]"
+    print(f"{prefix} {result.message}")
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = create_argument_parser()
+    args = parser.parse_args(argv)
+
+    providers = parse_provider_list(args.providers)
+    save_options = build_save_options_from_args(args)
+
+    if args.file:
+        file_path = Path(args.file).expanduser().resolve()
+        if not file_path.exists():
+            print(f"[ERROR] 文件不存在: {file_path}", file=sys.stderr)
+            return 2
+
+        query = read_audio_metadata(file_path)
+        print(f"[INFO] 搜索: {query.title} / {query.artist}")
+
+        if args.dry_run:
+            best, candidates = choose_best_candidate(
+                query,
+                providers,
+                prefer_synced=(
+                    save_options.lyric_mode != "plain"
+                    and not save_options.strip_timestamps
+                ),
+                logger=default_logger,
+            )
+            if not best:
+                print(f"[FAIL] 未找到歌词: {query.title} - {query.artist}")
+                return 1
+            print(
+                f"[OK] 预览来源: {best.source} | {best.title} - {best.artist} | "
+                f"synced={best.has_synced} | candidates={len(candidates)}"
+            )
+            return 0
+
+        result = process_query(query, providers, save_options, logger=default_logger)
+        cli_print_result(result)
+        return 0 if result.success else 1
+
+    if args.dir:
+        directory = Path(args.dir).expanduser().resolve()
+        if not directory.exists():
+            print(f"[ERROR] 文件夹不存在: {directory}", file=sys.stderr)
+            return 2
+
+        files = find_audio_files(directory, recursive=not args.non_recursive)
+        if not files:
+            print("[ERROR] 没找到音频文件", file=sys.stderr)
+            return 2
+
+        print(f"[INFO] 共找到 {len(files)} 个音频文件")
+        failed = 0
+
+        for index, file_path in enumerate(files, start=1):
+            print(f"\n=== [{index}/{len(files)}] 处理: {file_path.name} ===")
+            query = read_audio_metadata(file_path)
+            print(f"[INFO] 搜索: {query.title} / {query.artist}")
+
+            if args.dry_run:
+                best, candidates = choose_best_candidate(
+                    query,
+                    providers,
+                    prefer_synced=(
+                        save_options.lyric_mode != "plain"
+                        and not save_options.strip_timestamps
+                    ),
+                    logger=default_logger,
+                )
+                if not best:
+                    print(f"[FAIL] 未找到歌词: {query.title} - {query.artist}")
+                    failed += 1
+                    continue
+                print(
+                    f"[OK] 预览来源: {best.source} | {best.title} - {best.artist} | "
+                    f"synced={best.has_synced} | candidates={len(candidates)}"
+                )
+                continue
+
+            result = process_query(
+                query, providers, save_options, logger=default_logger
+            )
+            cli_print_result(result)
+            if not result.success:
+                failed += 1
+
+        if failed:
+            print(f"\n[SUMMARY] 完成，但有 {failed} 项失败。", file=sys.stderr)
+            return 1
+
+        print("\n[SUMMARY] 全部完成。")
+        return 0
+
+    if args.title:
+        query = build_manual_query(
+            args.title,
+            artist=args.artist,
+            album=args.album,
+            duration=args.duration,
+        )
+        print(f"[INFO] 搜索: {query.title} / {query.artist}")
+
+        if args.dry_run:
+            best, candidates = choose_best_candidate(
+                query,
+                providers,
+                prefer_synced=(
+                    save_options.lyric_mode != "plain"
+                    and not save_options.strip_timestamps
+                ),
+                logger=default_logger,
+            )
+            if not best:
+                print(f"[FAIL] 未找到歌词: {query.title} - {query.artist}")
+                return 1
+            print(
+                f"[OK] 预览来源: {best.source} | {best.title} - {best.artist} | "
+                f"synced={best.has_synced} | candidates={len(candidates)}"
+            )
+            return 0
+
+        result = process_query(query, providers, save_options, logger=default_logger)
+        cli_print_result(result)
+        return 0 if result.success else 1
+
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
