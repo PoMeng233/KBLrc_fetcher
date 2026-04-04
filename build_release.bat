@@ -1,149 +1,150 @@
 @echo off
 setlocal enabledelayedexpansion
 
-title Build Lyrics Fetcher Release
+title Build KBlrc_fetcher Release
 
 cd /d "%~dp0"
 
+set "PYTHON_EXE="
+set "APP_NAME=KBlrc_fetcher"
+set "SPEC_FILE=%APP_NAME%.spec"
+set "DIST_EXE=dist\%APP_NAME%.exe"
+set "RELEASE_DIR=release\%APP_NAME%"
+set "ZIP_NAME=%APP_NAME%.zip"
+
 echo ==========================================
-echo   Build Lyrics Fetcher Release Package
+echo   Build %APP_NAME% Release Package
 echo ==========================================
 echo.
 
-set "PY_CMD="
-set "PY_FALLBACK=C:\Users\PoMeng\AppData\Local\Programs\Python\Python313\python.exe"
-
+echo [STEP] Detecting Python...
 where py >nul 2>nul
 if not errorlevel 1 (
-    set "PY_CMD=py -3"
-)
-
-if not defined PY_CMD (
-    where python >nul 2>nul
+    py -3 --version >nul 2>nul
     if not errorlevel 1 (
-        set "PY_CMD=python"
+        set "PYTHON_EXE=py -3"
+        goto :python_ok
     )
 )
 
-if not defined PY_CMD (
-    if exist "%PY_FALLBACK%" (
-        set "PY_CMD="%PY_FALLBACK%""
+where python >nul 2>nul
+if not errorlevel 1 (
+    python --version >nul 2>nul
+    if not errorlevel 1 (
+        set "PYTHON_EXE=python"
+        goto :python_ok
     )
 )
 
-if not defined PY_CMD (
-    echo [ERROR] Could not find a usable Python interpreter.
-    echo.
-    echo Tried:
-    echo   1. py -3
-    echo   2. python
-    echo   3. %PY_FALLBACK%
-    echo.
-    echo Please install Python 3 or update PY_FALLBACK in this script.
-    pause
-    exit /b 1
+if exist "C:\Users\PoMeng\AppData\Local\Programs\Python\Python313\python.exe" (
+    set "PYTHON_EXE=C:\Users\PoMeng\AppData\Local\Programs\Python\Python313\python.exe"
+    goto :python_ok
 )
 
-echo [STEP] Using Python command: %PY_CMD%
+echo [ERROR] Python was not found.
+echo Tried: py -3, python, and fallback path.
+pause
+exit /b 1
+
+:python_ok
+echo [INFO] Using Python: %PYTHON_EXE%
 echo.
 
-echo [STEP] Checking Python...
-call %PY_CMD% --version
-if errorlevel 1 (
-    echo [ERROR] Python 3 is not available.
-    pause
-    exit /b 1
-)
-
-echo.
-echo [STEP] Installing / upgrading build dependencies...
-call %PY_CMD% -m pip install --upgrade pip
+echo [STEP] Installing dependencies...
+%PYTHON_EXE% -m pip install --upgrade pip
 if errorlevel 1 (
     echo [ERROR] Failed to upgrade pip.
     pause
     exit /b 1
 )
 
-call %PY_CMD% -m pip install -r requirements.txt
-if errorlevel 1 (
-    echo [ERROR] Failed to install requirements from requirements.txt.
-    pause
-    exit /b 1
+if exist requirements.txt (
+    %PYTHON_EXE% -m pip install -r requirements.txt
+    if errorlevel 1 (
+        echo [ERROR] Failed to install requirements.
+        pause
+        exit /b 1
+    )
 )
 
-call %PY_CMD% -m pip install --upgrade pyinstaller
+echo [STEP] Ensuring PyInstaller is installed...
+%PYTHON_EXE% -m pip install --upgrade pyinstaller
 if errorlevel 1 (
     echo [ERROR] Failed to install PyInstaller.
     pause
     exit /b 1
 )
-
 echo.
-echo [STEP] Cleaning old build artifacts...
+
+echo [STEP] Cleaning previous build artifacts...
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
-if exist LyricsFetcher.spec del /f /q LyricsFetcher.spec
-
+if exist "%SPEC_FILE%" del /f /q "%SPEC_FILE%"
 echo.
-echo [STEP] Building GUI executable with PyInstaller...
-call %PY_CMD% -m PyInstaller ^
+
+echo [STEP] Building executable...
+%PYTHON_EXE% -m PyInstaller ^
     --noconfirm ^
     --clean ^
     --windowed ^
     --onefile ^
-    --name LyricsFetcher ^
+    --name %APP_NAME% ^
     --collect-all mutagen ^
     --collect-all customtkinter ^
     --collect-all darkdetect ^
     lyrics_fetcher_gui.py
 
 if errorlevel 1 (
-    echo [ERROR] PyInstaller build failed.
+    echo [ERROR] Build failed.
+    pause
+    exit /b 1
+)
+echo.
+
+if not exist "%DIST_EXE%" (
+    echo [ERROR] Built executable not found: %DIST_EXE%
     pause
     exit /b 1
 )
 
-echo.
 echo [STEP] Preparing release folder...
 if not exist release mkdir release
-if exist release\LyricsFetcher rmdir /s /q release\LyricsFetcher
-mkdir release\LyricsFetcher
+if exist "%RELEASE_DIR%" rmdir /s /q "%RELEASE_DIR%"
+mkdir "%RELEASE_DIR%"
 
-copy /y dist\LyricsFetcher.exe release\LyricsFetcher\LyricsFetcher.exe >nul
+copy /y "%DIST_EXE%" "%RELEASE_DIR%\%APP_NAME%.exe" >nul
 if errorlevel 1 (
     echo [ERROR] Failed to copy built executable.
     pause
     exit /b 1
 )
 
-if exist README.md copy /y README.md release\LyricsFetcher\README.md >nul
-if exist fetch_lyrics.bat copy /y fetch_lyrics.bat release\LyricsFetcher\fetch_lyrics.bat >nul
-if exist fetch_lyrics_cli.bat copy /y fetch_lyrics_cli.bat release\LyricsFetcher\fetch_lyrics_cli.bat >nul
+if exist README.md copy /y README.md "%RELEASE_DIR%\README.md" >nul
+if exist fetch_lyrics.bat copy /y fetch_lyrics.bat "%RELEASE_DIR%\fetch_lyrics.bat" >nul
+if exist fetch_lyrics_cli.bat copy /y fetch_lyrics_cli.bat "%RELEASE_DIR%\fetch_lyrics_cli.bat" >nul
 
-echo @echo off> release\LyricsFetcher\run_gui.bat
-echo start "" "%%~dp0LyricsFetcher.exe">> release\LyricsFetcher\run_gui.bat
+echo @echo off> "%RELEASE_DIR%\run_gui.bat"
+echo start "" "%%~dp0%APP_NAME%.exe">> "%RELEASE_DIR%\run_gui.bat"
 
-echo.
-echo [STEP] Creating zip package (PowerShell)...
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "if (Test-Path 'release\LyricsFetcher.zip') { Remove-Item 'release\LyricsFetcher.zip' -Force }; Compress-Archive -Path 'release\LyricsFetcher\*' -DestinationPath 'release\LyricsFetcher.zip' -Force"
+echo [STEP] Creating zip archive...
+if exist "release\%ZIP_NAME%" del /f /q "release\%ZIP_NAME%"
+
+powershell -NoProfile -Command ^
+    "Compress-Archive -Path '%RELEASE_DIR%\*' -DestinationPath 'release\%ZIP_NAME%' -Force" >nul 2>nul
 
 if errorlevel 1 (
-    echo [WARN] ZIP creation failed, but the unpacked release folder is ready:
-    echo        %cd%\release\LyricsFetcher
-    echo.
-    echo [DONE] Build completed with warnings.
-    pause
-    exit /b 0
+    echo [WARN] Failed to create ZIP with PowerShell. You can package manually.
+) else (
+    echo [INFO] ZIP created: release\%ZIP_NAME%
 )
 
 echo.
 echo ==========================================
-echo [DONE] Build completed successfully.
-echo EXE:  %cd%\dist\LyricsFetcher.exe
-echo DIR:  %cd%\release\LyricsFetcher
-echo ZIP:  %cd%\release\LyricsFetcher.zip
+echo   Build completed successfully
 echo ==========================================
+echo Executable: %DIST_EXE%
+echo Release dir: %RELEASE_DIR%
+echo Zip package: release\%ZIP_NAME%
 echo.
 pause
-exit /b 0
+endlocal

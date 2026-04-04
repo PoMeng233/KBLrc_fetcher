@@ -6,7 +6,9 @@ import base64
 import json
 import re
 import sys
+import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -146,6 +148,7 @@ class SaveOptions:
     lyric_mode: str = "auto"  # auto | synced | plain
     include_metadata: bool = True
     strip_timestamps: bool = False
+    strip_translation_lines: bool = False
 
 
 @dataclass
@@ -164,6 +167,7 @@ class ProviderSearchStatus:
     ok: bool = False
     result_count: int = 0
     error: str = ""
+    timed_out: bool = False
 
 
 @dataclass
@@ -334,7 +338,7 @@ def build_manual_query(
     )
 
 
-def try_request(method: str, url: str, *, timeout: int = 12, **kwargs):
+def try_request(method: str, url: str, *, timeout: int = 8, **kwargs):
     response = SESSION.request(method, url, timeout=timeout, **kwargs)
     response.raise_for_status()
     return response
@@ -409,6 +413,7 @@ def render_lrc(
     lyric_mode: str = "auto",
     include_metadata: bool = True,
     strip_timestamps: bool = False,
+    strip_translation_lines: bool = False,
 ) -> str:
     body = candidate_best_text(candidate, lyric_mode)
 
@@ -416,6 +421,27 @@ def render_lrc(
         body = remove_lrc_timestamps(body)
 
     body = clean_plain_lyrics(body) if not is_timestamped_lyric(body) else body.strip()
+
+    if strip_translation_lines and body and (candidate.translated_lyrics or "").strip():
+        # Only remove lines that are known to come from translated_lyrics.
+        # This avoids accidentally deleting original lyric lines.
+        translated_lines = {
+            normalize_text(re.sub(r"^\[\d{2}:\d{2}(?:\.\d{1,3})?\]\s*", "", line))
+            for line in candidate.translated_lyrics.splitlines()
+            if line.strip()
+        }
+        translated_lines.discard("")
+
+        if translated_lines:
+            filtered_lines: list[str] = []
+            for line in body.splitlines():
+                norm = normalize_text(
+                    re.sub(r"^\[\d{2}:\d{2}(?:\.\d{1,3})?\]\s*", "", line)
+                )
+                if norm and norm in translated_lines:
+                    continue
+                filtered_lines.append(line)
+            body = "\n".join(filtered_lines).strip()
 
     header: list[str] = []
     if include_metadata:
@@ -425,7 +451,7 @@ def render_lrc(
             header.append(f"[ar:{candidate.artist}]")
         if candidate.album:
             header.append(f"[al:{candidate.album}]")
-        header.append("[by:lyrics_fetcher]")
+        header.append("[by:KBlrc_fetcher]")
 
     if header:
         return "\n".join(header + [""] + body.splitlines()) + "\n"
@@ -483,6 +509,7 @@ def save_lyrics(
         lyric_mode=options.lyric_mode,
         include_metadata=options.include_metadata,
         strip_timestamps=options.strip_timestamps,
+        strip_translation_lines=options.strip_translation_lines,
     )
     out_path.write_text(content, encoding="utf-8-sig")
     return out_path
@@ -550,6 +577,7 @@ def get_candidate_preview(
         lyric_mode=save_options.lyric_mode,
         include_metadata=save_options.include_metadata,
         strip_timestamps=save_options.strip_timestamps,
+        strip_translation_lines=save_options.strip_translation_lines,
     )
     return {
         "provider": candidate.source,
@@ -1207,26 +1235,86 @@ def search_candidates_by_source(
     providers: list[str],
     prefer_synced: bool = True,
     logger: Logger = None,
+    max_duration_sec: float = 15.0,
 ) -> SearchResultBundle:
     log = logger or (lambda _: None)
     normalized_providers = [p for p in providers if p in PROVIDER_FUNCS]
     bundle = SearchResultBundle(query=query, providers=normalized_providers)
 
     all_items: list[LyricsCandidate] = []
+    provider_items: dict[str, list[LyricsCandidate]] = {
+        provider: [] for provider in normalized_providers
+    }
 
-    for provider in normalized_providers:
-        log(f"[INFO] 搜索 {provider_label(provider)}: {query.title} / {query.artist}")
-        items, status = search_single_provider(query, provider)
-        bundle.provider_status[provider] = status
+    if not normalized_providers:
+        bundle.all_candidates = []
+        bundle.grouped_candidates = {}
+        return bundle
 
-        if status.error:
-            log(f"[WARN] {provider_label(provider)} 搜索失败: {status.error}")
-        else:
-            log(f"[INFO] {provider_label(provider)} 返回 {len(items)} 条结果")
+    start_ts = time.monotonic()
+    max_workers = min(6, max(1, len(normalized_providers)))
 
-        for item in items:
-            item.score = score_candidate(query, item)
-            all_items.append(item)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_provider = {}
+        for provider in normalized_providers:
+            log(
+                f"[INFO] 搜索 {provider_label(provider)}: {query.title} / {query.artist}"
+            )
+            future = executor.submit(search_single_provider, query, provider)
+            future_to_provider[future] = provider
+
+        completed = set()
+        remaining = set(future_to_provider.keys())
+
+        while remaining:
+            elapsed = time.monotonic() - start_ts
+            remaining_time = max_duration_sec - elapsed
+            if remaining_time <= 0:
+                break
+
+            try:
+                done_batch = next(iter(as_completed(remaining, timeout=remaining_time)))
+            except Exception:
+                break
+
+            provider = future_to_provider[done_batch]
+            remaining.remove(done_batch)
+            completed.add(done_batch)
+
+            try:
+                items, status = done_batch.result()
+            except Exception as exc:
+                items = []
+                status = ProviderSearchStatus(
+                    provider=provider, error=str(exc), ok=False
+                )
+
+            bundle.provider_status[provider] = status
+            provider_items[provider] = list(items)
+
+            if status.error:
+                log(f"[WARN] {provider_label(provider)} 搜索失败: {status.error}")
+            else:
+                log(f"[INFO] {provider_label(provider)} 返回 {len(items)} 条结果")
+
+            for item in items:
+                item.score = score_candidate(query, item)
+                all_items.append(item)
+
+        # 超时未完成的 provider 标记为 timed_out
+        for future in remaining:
+            provider = future_to_provider[future]
+            future.cancel()
+            timeout_status = ProviderSearchStatus(
+                provider=provider,
+                ok=False,
+                result_count=0,
+                error=f"provider timeout (> {max_duration_sec:.1f}s overall)",
+                timed_out=True,
+            )
+            bundle.provider_status[provider] = timeout_status
+            provider_items[provider] = []
+            log(f"[WARN] {provider_label(provider)} 超时，已跳过")
 
     ranked = rank_and_deduplicate_candidates(all_items, query)
     grouped: dict[str, list[LyricsCandidate]] = {}

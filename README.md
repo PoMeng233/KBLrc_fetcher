@@ -1,4 +1,4 @@
-# Lyrics Fetcher
+# KB歌词搜索（KBlrc_fetcher）
 
 一个简洁的多源歌词搜索工具（GUI + CLI）。
 

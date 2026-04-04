@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import queue
 import threading
 from pathlib import Path
@@ -22,6 +23,8 @@ except ImportError:
     TkinterDnD = None
 
 import lyrics_fetcher as core
+
+SETTINGS_PATH = Path(__file__).with_name("gui_settings.json")
 
 
 class ModernButton(ctk.CTkButton):
@@ -59,7 +62,7 @@ class GlassFrame(ctk.CTkFrame):
 
 class LyricsFetcherGUI(ctk.CTk):
     """
-    Main GUI class for Lyrics Fetcher.
+    Main GUI class for KB歌词搜索.
     Supports drag-and-drop if tkinterdnd2 is available.
     """
 
@@ -69,7 +72,7 @@ class LyricsFetcherGUI(ctk.CTk):
         ctk.set_appearance_mode("system")
         ctk.set_default_color_theme("blue")
 
-        self.title("Lyrics Fetcher - 歌词搜索工具")
+        self.title("KB歌词搜索 - KBlrc_fetcher")
         self.geometry("1200x800")
         self.minsize(900, 600)
 
@@ -91,7 +94,11 @@ class LyricsFetcherGUI(ctk.CTk):
         self.selected_candidate: Optional[core.LyricsCandidate] = None
 
         self._init_vars()
+        self._suspend_query_sync = False
         self._build_ui()
+
+        # 启动时检查歌词源可用性
+        self._check_provider_health()
 
         # 先尝试为当前窗口注入 DnD 能力，再注册拖放
         self._enable_dnd_if_possible()
@@ -111,8 +118,9 @@ class LyricsFetcherGUI(ctk.CTk):
         # 保存和歌词选项
         self.name_format_var = ctk.StringVar(value="file")
         self.lyric_mode_var = ctk.StringVar(value="auto")
-        self.include_metadata_var = ctk.BooleanVar(value=True)
+        self.include_metadata_var = ctk.BooleanVar(value=False)
         self.strip_timestamps_var = ctk.BooleanVar(value=False)
+        self.strip_translation_var = ctk.BooleanVar(value=False)
         self.overwrite_var = ctk.BooleanVar(value=False)
 
         # 歌词源
@@ -123,6 +131,7 @@ class LyricsFetcherGUI(ctk.CTk):
         # UI 状态
         self.status_var = ctk.StringVar(value="准备就绪")
         self.result_count_var = ctk.StringVar(value="0 条结果")
+        self._load_settings()
 
     def _build_ui(self) -> None:
         # 设置背景
@@ -154,7 +163,7 @@ class LyricsFetcherGUI(ctk.CTk):
         header.grid_columnconfigure(0, weight=1)
 
         title = ctk.CTkLabel(
-            header, text="🎵 Lyrics Fetcher", font=ctk.CTkFont(size=24, weight="bold")
+            header, text="🎵 KB歌词搜索", font=ctk.CTkFont(size=24, weight="bold")
         )
         title.grid(row=0, column=0, sticky="w", padx=16, pady=12)
 
@@ -220,6 +229,8 @@ class LyricsFetcherGUI(ctk.CTk):
         )
         self.duration_entry.grid(row=0, column=1, sticky="e", padx=(4, 0))
 
+        self._bind_query_reset_handlers()
+
         # 歌词源选择 - 紧凑网格
         ctk.CTkLabel(
             left, text="📚 歌词源", font=ctk.CTkFont(size=12, weight="bold")
@@ -276,6 +287,13 @@ class LyricsFetcherGUI(ctk.CTk):
             variable=self.overwrite_var,
             font=ctk.CTkFont(size=10),
         ).grid(row=2, column=0, sticky="w", pady=2)
+
+        ctk.CTkCheckBox(
+            options_frame,
+            text="自动去除翻译行",
+            variable=self.strip_translation_var,
+            font=ctk.CTkFont(size=10),
+        ).grid(row=3, column=0, sticky="w", pady=2)
 
         # 输出目录
         ctk.CTkLabel(
@@ -491,6 +509,7 @@ class LyricsFetcherGUI(ctk.CTk):
         if hasattr(self, "drag_overlay"):
             self.drag_overlay.grid()
             self.drag_overlay.lift()
+            self.drag_overlay.focus_force()
 
     def _hide_drag_overlay(self) -> None:
         if hasattr(self, "drag_overlay"):
@@ -615,20 +634,27 @@ class LyricsFetcherGUI(ctk.CTk):
             ).grid(row=2, column=0, sticky="w", padx=12, pady=(4, 0))
 
         # 行为
-        def select_this():
+        def select_this(refresh: bool = True):
             self.selected_candidate = cand
             self.save_btn.configure(state="normal")
             self.preview_btn.configure(state="normal")
             self.status_var.set(
                 f"已选中：{cand.title or '未知标题'} - {cand.artist or '未知歌手'}"
             )
-            self._refresh_results()
+            if refresh:
+                self._refresh_results()
+
+        def open_preview():
+            # 双击时先选中但不立即刷新，避免刷新重建卡片导致预览回调丢失
+            select_this(refresh=False)
+            self._preview_candidate()
 
         preview_text = core.render_lrc(
             cand,
             lyric_mode=self.lyric_mode_var.get(),
             include_metadata=bool(self.include_metadata_var.get()),
             strip_timestamps=bool(self.strip_timestamps_var.get()),
+            strip_translation_lines=bool(self.strip_translation_var.get()),
         )
         snippet = "\n".join(preview_text.splitlines()[:4]).strip() or "（无歌词内容）"
 
@@ -641,16 +667,19 @@ class LyricsFetcherGUI(ctk.CTk):
             text_color=("#475569", "#94a3b8"),
         ).grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 10))
 
-        card.bind("<Button-1>", lambda e: select_this())
-        card.bind(
-            "<Double-Button-1>", lambda e: (select_this(), self._preview_candidate())
-        )
+        def _on_single_click(_event=None):
+            # 延迟一点执行，避免和双击事件冲突
+            card.after(180, lambda: select_this())
+
+        def _on_double_click(_event=None):
+            open_preview()
+            return "break"
+
+        card.bind("<Button-1>", _on_single_click)
+        card.bind("<Double-Button-1>", _on_double_click)
         for child in card.winfo_children():
-            child.bind("<Button-1>", lambda e: select_this())
-            child.bind(
-                "<Double-Button-1>",
-                lambda e: (select_this(), self._preview_candidate()),
-            )
+            child.bind("<Button-1>", _on_single_click)
+            child.bind("<Double-Button-1>", _on_double_click)
 
     def _refresh_results(self) -> None:
         """刷新结果显示"""
@@ -673,17 +702,39 @@ class LyricsFetcherGUI(ctk.CTk):
             return
 
         try:
-            if not self.current_query:
-                title = self.title_entry.get().strip()
-                artist = self.artist_entry.get().strip()
-                if not title:
-                    messagebox.showwarning("错误", "请输入歌曲名")
+            title = self.title_entry.get().strip()
+            artist = self.artist_entry.get().strip()
+            album = self.album_entry.get().strip()
+
+            duration_text = self.duration_entry.get().strip()
+            duration_val = None
+            if duration_text:
+                if not duration_text.isdigit():
+                    messagebox.showwarning("错误", "时长必须是数字（秒）")
                     return
-                self.current_query = core.build_manual_query(title, artist)
+                duration_val = int(duration_text)
 
             providers = [k for k, v in self.provider_vars.items() if v.get()]
             if not providers:
                 messagebox.showwarning("错误", "请至少选择一个歌词源")
+                return
+
+            valid_providers = set(core.available_providers())
+            invalid = [p for p in providers if p not in valid_providers]
+            if invalid:
+                messagebox.showwarning("错误", f"存在无效歌词源：{', '.join(invalid)}")
+                return
+
+            # 手动输入优先；若未填写则允许回退到已识别的文件查询
+            if title:
+                self.current_query = core.build_manual_query(
+                    title=title,
+                    artist=artist,
+                    album=album,
+                    duration=duration_val,
+                )
+            elif not self.current_query:
+                messagebox.showwarning("错误", "请输入歌曲名")
                 return
         except Exception as e:
             messagebox.showerror("错误", str(e))
@@ -707,6 +758,7 @@ class LyricsFetcherGUI(ctk.CTk):
                 providers,
                 prefer_synced=True,
                 logger=lambda msg: self.log_queue.put(msg),
+                max_duration_sec=12.0,
             )
 
             if isinstance(bundle, dict):
@@ -735,6 +787,7 @@ class LyricsFetcherGUI(ctk.CTk):
                 lyric_mode=self.lyric_mode_var.get(),
                 include_metadata=bool(self.include_metadata_var.get()),
                 strip_timestamps=bool(self.strip_timestamps_var.get()),
+                strip_translation_lines=bool(self.strip_translation_var.get()),
             )
 
             output_path = core.save_selected_candidate(
@@ -785,11 +838,17 @@ class LyricsFetcherGUI(ctk.CTk):
     def _load_file_query_and_search(self, file_path: Path) -> None:
         """从音频文件读取元数据并自动搜索"""
         query = core.read_audio_metadata(file_path)
-        self.title_var.set(query.title)
-        self.artist_var.set(query.artist)
-        self.album_var.set(query.album)
-        if query.duration:
-            self.duration_var.set(str(query.duration))
+        self._suspend_query_sync = True
+        try:
+            self.title_var.set(query.title)
+            self.artist_var.set(query.artist)
+            self.album_var.set(query.album)
+            if query.duration:
+                self.duration_var.set(str(query.duration))
+            else:
+                self.duration_var.set("")
+        finally:
+            self._suspend_query_sync = False
 
         self.status_var.set(f"✅ 已识别：{file_path.name}")
         self.current_query = query
@@ -827,23 +886,129 @@ class LyricsFetcherGUI(ctk.CTk):
             lyric_mode=self.lyric_mode_var.get(),
             include_metadata=bool(self.include_metadata_var.get()),
             strip_timestamps=bool(self.strip_timestamps_var.get()),
+            strip_translation_lines=bool(self.strip_translation_var.get()),
         )
 
         win = ctk.CTkToplevel(self)
-        win.title("歌词预览")
+        win.title("KB歌词搜索 - 歌词预览")
         win.geometry("760x520")
         win.minsize(560, 380)
         win.grid_rowconfigure(0, weight=1)
         win.grid_columnconfigure(0, weight=1)
+
+        # 确保预览窗口显示在最前并获得焦点
+        win.transient(self)
+        win.attributes("-topmost", True)
+        win.deiconify()
+        win.lift()
+        win.focus_force()
+        win.grab_set()
+        win.after(600, lambda: win.attributes("-topmost", False))
 
         box = Text(win, wrap="word", font=("Consolas", 11), bg="#0f172a", fg="#e2e8f0")
         box.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         box.insert("1.0", text if text.strip() else "（无歌词内容）")
         box.config(state="disabled")
 
+    def _check_provider_health(self) -> None:
+        """启动时检查 GUI 中配置的歌词源是否有效"""
+        valid = set(core.available_providers())
+        invalid = [name for name in self.provider_vars.keys() if name not in valid]
+
+        if invalid:
+            for name in invalid:
+                if name in self.provider_vars:
+                    self.provider_vars[name].set(False)
+            self.status_var.set(f"⚠️ 已禁用无效歌词源: {', '.join(invalid)}")
+        else:
+            self.status_var.set("准备就绪（歌词源检查通过）")
+
+    def _bind_query_reset_handlers(self) -> None:
+        for widget, placeholder in (
+            (self.title_entry, "歌曲名"),
+            (self.artist_entry, "歌手"),
+            (self.album_entry, "专辑"),
+            (self.duration_entry, "时长(秒)"),
+        ):
+            widget.bind("<KeyRelease>", self._on_manual_query_input, add="+")
+            widget.bind("<<Paste>>", self._on_manual_query_input, add="+")
+            widget.bind("<FocusIn>", self._on_manual_query_input, add="+")
+            widget.bind("<FocusOut>", self._on_manual_query_input, add="+")
+            widget.configure(placeholder_text=placeholder)
+
+        # 初始化时强制刷新占位文本，避免显示为空白
+        self.title_entry.configure(placeholder_text="歌曲名")
+        self.artist_entry.configure(placeholder_text="歌手")
+        self.album_entry.configure(placeholder_text="专辑")
+        self.duration_entry.configure(placeholder_text="时长(秒)")
+
+    def _on_manual_query_input(self, _event=None) -> None:
+        if getattr(self, "_suspend_query_sync", False):
+            return
+        # 用户手动修改输入时，清除旧的文件识别查询，避免搜索参数“看起来空但仍沿用旧值”
+        self.current_query = None
+
+        # 保障占位提示不会被异常状态覆盖，且空值时强制显示占位
+        self.title_entry.configure(placeholder_text="歌曲名")
+        self.artist_entry.configure(placeholder_text="歌手")
+        self.album_entry.configure(placeholder_text="专辑")
+        self.duration_entry.configure(placeholder_text="时长(秒)")
+
+    def _settings_payload(self) -> dict:
+        return {
+            "providers": {k: bool(v.get()) for k, v in self.provider_vars.items()},
+            "include_metadata": bool(self.include_metadata_var.get()),
+            "strip_timestamps": bool(self.strip_timestamps_var.get()),
+            "strip_translation": bool(self.strip_translation_var.get()),
+            "overwrite": bool(self.overwrite_var.get()),
+            "name_format": self.name_format_var.get(),
+            "lyric_mode": self.lyric_mode_var.get(),
+            "out_dir": self.out_dir_var.get(),
+        }
+
+    def _load_settings(self) -> None:
+        if not SETTINGS_PATH.exists():
+            return
+        try:
+            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        providers = data.get("providers", {})
+        if isinstance(providers, dict):
+            for key, var in self.provider_vars.items():
+                if key in providers:
+                    var.set(bool(providers.get(key)))
+
+        self.include_metadata_var.set(bool(data.get("include_metadata", False)))
+        self.strip_timestamps_var.set(bool(data.get("strip_timestamps", False)))
+        self.strip_translation_var.set(bool(data.get("strip_translation", False)))
+        self.overwrite_var.set(bool(data.get("overwrite", False)))
+
+        if data.get("name_format"):
+            self.name_format_var.set(str(data.get("name_format")))
+        if data.get("lyric_mode"):
+            self.lyric_mode_var.set(str(data.get("lyric_mode")))
+        if isinstance(data.get("out_dir"), str):
+            self.out_dir_var.set(data.get("out_dir"))
+
+    def _save_settings(self) -> None:
+        try:
+            SETTINGS_PATH.write_text(
+                json.dumps(self._settings_payload(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _on_close(self) -> None:
+        self._save_settings()
+        self.destroy()
+
 
 def main() -> None:
     app = LyricsFetcherGUI()
+    app.protocol("WM_DELETE_WINDOW", app._on_close)
     app.mainloop()
 
 

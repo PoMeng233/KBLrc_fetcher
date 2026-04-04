@@ -2,3 +2,5 @@
 /dist
 /__pycache__
 /build
+gui_settings.json
+.gitignore

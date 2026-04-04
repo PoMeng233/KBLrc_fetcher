@@ -22,14 +22,14 @@ if exist "%DEFAULT_PYTHON%" (
     goto :end
 )
 
-echo [ERROR] Python was not found in PATH, and the fallback path does not exist.
+echo [ERROR] 未找到可用的 Python，无法启动 KB歌词搜索（KBlrc_fetcher）。
 echo.
 echo Tried:
 echo   1. py
 echo   2. python
 echo   3. %DEFAULT_PYTHON%
 echo.
-echo Please install Python or update this launcher with the correct Python path.
+echo Please install Python or update this launcher with the correct Python path for KB歌词搜索.
 pause
 
 :end
