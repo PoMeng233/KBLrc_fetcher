@@ -92,6 +92,14 @@ class LyricsFetcherGUI(ctk.CTk):
         self.current_query: Optional[core.TrackQuery] = None
         self.current_candidates: list[core.LyricsCandidate] = []
         self.selected_candidate: Optional[core.LyricsCandidate] = None
+        self._selected_index: int = -1
+        self._card_widgets: list[ctk.CTkFrame] = []
+        self._is_streaming_search: bool = False
+        self._last_scroll_pos: float = 0.0
+        self.search_dot_step: int = 0
+        self._streaming_tip_row: Optional[ctk.CTkFrame] = None
+        self._query_from_dropped_directory: bool = False
+        self._dropped_base_dir: Optional[Path] = None
 
         self._init_vars()
         self._suspend_query_sync = False
@@ -578,10 +586,34 @@ class LyricsFetcherGUI(ctk.CTk):
             self.status_var.set("❌ 未检测到拖入文件")
             return
 
-        file_path = Path(str(files[0]).strip("{}"))
-        if file_path.exists() and file_path.suffix.lower() in core.AUDIO_EXTENSIONS:
+        dropped_path = Path(str(files[0]).strip("{}"))
+        if not dropped_path.exists():
+            self.status_var.set("❌ 拖入路径不存在")
+            return
+
+        # 支持拖入目录：自动扫描音频文件并取第一首执行搜索
+        if dropped_path.is_dir():
             try:
-                self._load_file_query_and_search(file_path)
+                audio_files = core.find_audio_files(dropped_path, recursive=True)
+                if not audio_files:
+                    self.status_var.set("❌ 拖入目录中未找到可识别音频文件")
+                    return
+                target_file = audio_files[0]
+                self._query_from_dropped_directory = True
+                self._dropped_base_dir = dropped_path
+                self.status_var.set(f"📁 已识别目录，使用：{target_file.name}")
+                self._load_file_query_and_search(target_file)
+                return
+            except Exception as e:
+                self.status_var.set(f"❌ 目录识别失败：{str(e)[:30]}")
+                return
+
+        # 拖入单文件
+        if dropped_path.suffix.lower() in core.AUDIO_EXTENSIONS:
+            try:
+                self._query_from_dropped_directory = False
+                self._dropped_base_dir = dropped_path.parent
+                self._load_file_query_and_search(dropped_path)
             except Exception as e:
                 self.status_var.set(f"❌ 识别失败：{str(e)[:30]}")
         else:
@@ -611,36 +643,47 @@ class LyricsFetcherGUI(ctk.CTk):
         ).pack(pady=(0, 24))
 
     def _build_result_card(self, cand: core.LyricsCandidate, idx: int) -> None:
-        """构建结果卡片"""
-        selected = self.selected_candidate is cand
+        """构建结果卡片（支持来源色条 + 滑入动效）"""
+        selected = idx == self._selected_index
         compact = (
             bool(self.compact_mode_var.get())
             if hasattr(self, "compact_mode_var")
             else True
         )
+
+        provider_accent = {
+            "netease": ("#ef4444", "#f87171"),  # 红
+            "qq": ("#3b82f6", "#60a5fa"),  # 蓝
+            "kugou": ("#f59e0b", "#fbbf24"),  # 橙
+            "kuwo": ("#a855f7", "#c084fc"),  # 紫
+            "lrclib": ("#10b981", "#34d399"),  # 绿
+            "lyricsovh": ("#64748b", "#94a3b8"),  # 灰蓝
+        }.get(cand.source, ("#64748b", "#94a3b8"))
+
         card = GlassFrame(
             self.results_scroll,
             bg_color=("#dbeafe", "#1e293b") if selected else ("#ffffff", "#111827"),
         )
         card.grid(row=idx, column=0, sticky="ew", pady=4 if compact else 6)
         card.grid_columnconfigure(0, weight=1)
+        self._card_widgets.append(card)
 
-        # 标题和来源
-        compact = (
-            bool(self.compact_mode_var.get())
-            if hasattr(self, "compact_mode_var")
-            else True
+        # 顶部色条（来源视觉分组）
+        accent_bar = ctk.CTkFrame(
+            card, fg_color=provider_accent, height=3, corner_radius=6
         )
+        accent_bar.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
+
         header = ctk.CTkFrame(card, fg_color="transparent")
         header.grid(
-            row=0, column=0, sticky="ew", padx=10, pady=((7 if compact else 10), 3)
+            row=1, column=0, sticky="ew", padx=10, pady=((4 if compact else 7), 3)
         )
         header.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
             header,
             text=cand.title or "未知",
-            font=ctk.CTkFont(size=11 if compact else 12, weight="bold"),
+            font=ctk.CTkFont(size=13 if compact else 15, weight="bold"),
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
 
@@ -657,20 +700,18 @@ class LyricsFetcherGUI(ctk.CTk):
             header,
             text=f"📍 {provider_label}",
             font=ctk.CTkFont(size=10),
-            text_color=("#4f46e5", "#818cf8"),
+            text_color=provider_accent,
         ).grid(row=0, column=1, sticky="e")
 
-        # 元数据
         meta = f"{cand.artist or '未知'} • {cand.album or '未知'}"
         ctk.CTkLabel(
             card,
             text=meta,
-            font=ctk.CTkFont(size=9 if compact else 10),
+            font=ctk.CTkFont(size=11 if compact else 12),
             text_color=("#6b7280", "#9ca3af"),
             anchor="w",
-        ).grid(row=1, column=0, sticky="w", padx=10, pady=1)
+        ).grid(row=2, column=0, sticky="w", padx=10, pady=(2, 2))
 
-        # 标签
         badges = []
         if cand.has_synced:
             badges.append("⏱️ 时间轴")
@@ -683,26 +724,10 @@ class LyricsFetcherGUI(ctk.CTk):
             ctk.CTkLabel(
                 card,
                 text=" | ".join(badges),
-                font=ctk.CTkFont(size=8 if compact else 9),
+                font=ctk.CTkFont(size=10 if compact else 11),
                 text_color=("#6b7280", "#a0aac0"),
                 anchor="w",
-            ).grid(row=2, column=0, sticky="w", padx=10, pady=(2, 0))
-
-        # 行为
-        def select_this(refresh: bool = True):
-            self.selected_candidate = cand
-            self.save_btn.configure(state="normal")
-            self.preview_btn.configure(state="normal")
-            self.status_var.set(
-                f"已选中：{cand.title or '未知标题'} - {cand.artist or '未知歌手'}"
-            )
-            if refresh:
-                self._refresh_results()
-
-        def open_preview():
-            # 双击时先选中但不立即刷新，避免刷新重建卡片导致预览回调丢失
-            select_this(refresh=False)
-            self._preview_candidate()
+            ).grid(row=3, column=0, sticky="w", padx=10, pady=(3, 1))
 
         preview_text = core.render_lrc(
             cand,
@@ -719,15 +744,29 @@ class LyricsFetcherGUI(ctk.CTk):
         ctk.CTkLabel(
             card,
             text=snippet,
-            font=ctk.CTkFont(size=9 if compact else 10),
+            font=ctk.CTkFont(size=11 if compact else 12),
             justify="left",
             anchor="w",
             text_color=("#475569", "#94a3b8"),
-        ).grid(row=3, column=0, sticky="ew", padx=10, pady=(4, 7 if compact else 10))
+        ).grid(row=4, column=0, sticky="ew", padx=10, pady=(5, 8 if compact else 10))
+
+        def select_this():
+            # 保持当前位置，不重建列表，避免滚动条跳动
+            self._selected_index = idx
+            self.selected_candidate = cand
+            self.save_btn.configure(state="normal")
+            self.preview_btn.configure(state="normal")
+            self.status_var.set(
+                f"已选中：{cand.title or '未知标题'} - {cand.artist or '未知歌手'}"
+            )
+            self._update_selection_highlight()
+
+        def open_preview():
+            select_this()
+            self._preview_candidate()
 
         def _on_single_click(_event=None):
-            # 延迟一点执行，避免和双击事件冲突
-            card.after(180, lambda: select_this())
+            card.after(120, select_this)
 
         def _on_double_click(_event=None):
             open_preview()
@@ -739,10 +778,21 @@ class LyricsFetcherGUI(ctk.CTk):
             child.bind("<Button-1>", _on_single_click)
             child.bind("<Double-Button-1>", _on_double_click)
 
+        # 右->左滑入 + 透明渐变视觉（近似）
+        self._animate_card_slide_in(card, idx)
+
     def _refresh_results(self) -> None:
-        """刷新结果显示"""
+        """刷新结果显示（完整重建，仅用于模式切换/搜索完成）"""
+        # 记录滚动位置，重建后恢复，减少跳动
+        try:
+            self._last_scroll_pos = float(self.results_scroll._parent_canvas.yview()[0])
+        except Exception:
+            self._last_scroll_pos = 0.0
+
         for child in self.results_scroll.winfo_children():
             child.destroy()
+
+        self._card_widgets = []
 
         if not self.current_candidates:
             self.save_btn.configure(state="disabled")
@@ -751,10 +801,20 @@ class LyricsFetcherGUI(ctk.CTk):
             return
 
         for idx, cand in enumerate(self.current_candidates):
-            self.after(idx * 18, lambda i=idx, c=cand: self._build_result_card(c, i))
+            self._build_result_card(cand, idx)
+
+        if self._is_streaming_search:
+            self._show_streaming_tip_row()
+
+        self._update_selection_highlight()
+
+        try:
+            self.results_scroll._parent_canvas.yview_moveto(self._last_scroll_pos)
+        except Exception:
+            pass
 
     def _start_search(self) -> None:
-        """启动搜索"""
+        """启动搜索（增量流式展示）"""
         if self.search_thread and self.search_thread.is_alive():
             messagebox.showinfo("提示", "当前搜索在进行中")
             return
@@ -798,8 +858,20 @@ class LyricsFetcherGUI(ctk.CTk):
             messagebox.showerror("错误", str(e))
             return
 
-        self.status_var.set("🔍 正在搜索...")
-        self.search_btn.configure(state="disabled")
+        self.search_dot_step = 0
+        self.status_var.set("🔍 正在搜索")
+        self.search_btn.configure(state="disabled", text="搜索中...")
+        self.quick_search_btn.configure(state="disabled")
+
+        # 新搜索前清理状态
+        self._is_streaming_search = True
+        self.current_candidates = []
+        self.selected_candidate = None
+        self._selected_index = -1
+        self.result_count_var.set("0 条结果")
+        self._refresh_results()
+
+        self._animate_search_status_dots()
 
         self.search_thread = threading.Thread(
             target=self._search_worker,
@@ -809,23 +881,25 @@ class LyricsFetcherGUI(ctk.CTk):
         self.search_thread.start()
 
     def _search_worker(self, query: core.TrackQuery, providers: list[str]) -> None:
-        """搜索线程"""
+        """搜索线程（按来源增量推送结果）"""
         try:
-            bundle = core.search_candidates_by_source(
-                query,
-                providers,
-                prefer_synced=True,
-                logger=lambda msg: self.log_queue.put(msg),
-                max_duration_sec=12.0,
-            )
+            for provider in providers:
+                items, status = core.search_single_provider(query, provider)
+                if status.error:
+                    self.log_queue.put(
+                        f"[WARN] {core.provider_label(provider)} 搜索失败: {status.error}"
+                    )
+                else:
+                    self.log_queue.put(
+                        f"[INFO] {core.provider_label(provider)} 返回 {len(items)} 条结果"
+                    )
 
-            if isinstance(bundle, dict):
-                candidates = list(bundle.get("all_candidates", []))
-            else:
-                candidates = list(getattr(bundle, "all_candidates", []))
+                if items:
+                    # 仅把原始结果传给 UI 线程，避免跨线程修改 UI 状态
+                    self.ui_queue.put(("provider_items", list(items)))
 
-            self.current_candidates = candidates
-            self.ui_queue.put(("search_done", None))
+            # 通知 UI 线程进行最终排序/去重（线程安全）
+            self.ui_queue.put(("finalize_results", {"query": query}))
         except Exception as e:
             self.ui_queue.put(("search_error", str(e)))
 
@@ -836,12 +910,67 @@ class LyricsFetcherGUI(ctk.CTk):
             return
 
         try:
+            out_dir_value = self.out_dir_var.get().strip()
+            selected_out_dir: Optional[Path] = (
+                Path(out_dir_value) if out_dir_value else None
+            )
+
+            # 当输出路径为空时，询问保存策略：
+            # - 若当前查询有源歌曲目录：可直接保存到源目录
+            # - 否则可选择目录或使用软件目录下 lrc_output
+            if selected_out_dir is None:
+                source_dir = None
+                if self.current_query.source_file:
+                    source_dir = self.current_query.source_file.parent
+                elif self._dropped_base_dir:
+                    source_dir = self._dropped_base_dir
+
+                if source_dir is not None:
+                    choice = messagebox.askyesnocancel(
+                        "选择保存位置",
+                        "当前未设置输出路径。\n\n"
+                        "是：直接保存到歌曲源目录\n"
+                        "否：选择其它目录\n"
+                        "取消：使用软件目录下 lrc_output",
+                    )
+                    if choice is True:
+                        selected_out_dir = source_dir
+                        self.out_dir_var.set(str(source_dir))
+                    elif choice is False:
+                        chosen = filedialog.askdirectory(title="选择歌词保存目录")
+                        if not chosen:
+                            return
+                        selected_out_dir = Path(chosen)
+                        self.out_dir_var.set(chosen)
+                    else:
+                        fallback = Path.cwd() / "lrc_output"
+                        selected_out_dir = fallback
+                        self.out_dir_var.set(str(fallback))
+                else:
+                    choice = messagebox.askyesnocancel(
+                        "选择保存位置",
+                        "当前未设置输出路径，且无法确定歌曲源目录。\n\n"
+                        "是：选择一个保存目录\n"
+                        "否：使用软件目录下 lrc_output\n"
+                        "取消：放弃本次保存",
+                    )
+                    if choice is None:
+                        return
+                    if choice is True:
+                        chosen = filedialog.askdirectory(title="选择歌词保存目录")
+                        if not chosen:
+                            return
+                        selected_out_dir = Path(chosen)
+                        self.out_dir_var.set(chosen)
+                    else:
+                        fallback = Path.cwd() / "lrc_output"
+                        selected_out_dir = fallback
+                        self.out_dir_var.set(str(fallback))
+
             save_options = core.SaveOptions(
                 output_mode=self.name_format_var.get(),
                 overwrite=bool(self.overwrite_var.get()),
-                out_dir=Path(self.out_dir_var.get())
-                if self.out_dir_var.get()
-                else None,
+                out_dir=selected_out_dir,
                 lyric_mode=self.lyric_mode_var.get(),
                 include_metadata=bool(self.include_metadata_var.get()),
                 strip_timestamps=bool(self.strip_timestamps_var.get()),
@@ -881,14 +1010,44 @@ class LyricsFetcherGUI(ctk.CTk):
             except queue.Empty:
                 break
 
-            if event == "search_done":
+            if event == "provider_items":
+                items = list(payload) if isinstance(payload, list) else []
+                if items:
+                    self._append_stream_results(items)
+                    self.result_count_var.set(f"{len(self.current_candidates)} 条结果")
+                    self.status_var.set(
+                        f"🔎 已收到 {len(self.current_candidates)} 条结果"
+                    )
+            elif event == "finalize_results":
+                query = None
+                if isinstance(payload, dict):
+                    query = payload.get("query")
+                if query is None:
+                    query = self.current_query
+
+                if query is not None:
+                    self.current_candidates = core.rank_and_deduplicate_candidates(
+                        self.current_candidates, query
+                    )
+                else:
+                    self.current_candidates.sort(
+                        key=lambda c: getattr(c, "score", 0.0), reverse=True
+                    )
+
+                self.ui_queue.put(("search_done", None))
+            elif event == "search_done":
+                self._is_streaming_search = False
                 self.search_btn.configure(state="normal", text="搜索歌词")
+                self.quick_search_btn.configure(state="normal")
                 self.result_count_var.set(f"{len(self.current_candidates)} 条结果")
                 self.status_var.set("✅ 搜索完成")
                 self._refresh_results()
             elif event == "search_error":
+                self._is_streaming_search = False
                 self.search_btn.configure(state="normal", text="搜索歌词")
+                self.quick_search_btn.configure(state="normal")
                 self.status_var.set(f"❌ {str(payload)}")
+                self._refresh_results()
                 messagebox.showerror("搜索错误", str(payload))
 
         self.after(100, self._drain_queues)
@@ -928,6 +1087,8 @@ class LyricsFetcherGUI(ctk.CTk):
             messagebox.showwarning("错误", "不支持的文件格式")
             return
         try:
+            self._query_from_dropped_directory = False
+            self._dropped_base_dir = path_obj.parent
             self._load_file_query_and_search(path_obj)
         except Exception as e:
             messagebox.showerror("错误", f"读取音频元数据失败：{e}")
@@ -1099,6 +1260,108 @@ class LyricsFetcherGUI(ctk.CTk):
     def _on_close(self) -> None:
         self._save_settings()
         self.destroy()
+
+    def _append_stream_results(self, items: list[core.LyricsCandidate]) -> None:
+        """增量追加结果并渲染（等待动画完成后显示内容）"""
+        base_len = len(self.current_candidates)
+        self.current_candidates.extend(items)
+        for idx, cand in enumerate(items, start=base_len):
+            self._build_result_card(cand, idx)
+
+        self._show_streaming_tip_row()
+
+    def _update_selection_highlight(self) -> None:
+        """仅更新选中样式，不重建列表，防止滚动位置跳动"""
+        for idx, card in enumerate(self._card_widgets):
+            selected = idx == self._selected_index
+            try:
+                card.configure(
+                    fg_color=("#dbeafe", "#1e293b")
+                    if selected
+                    else ("#ffffff", "#111827")
+                )
+            except Exception:
+                pass
+
+    def _animate_card_slide_in(self, card: ctk.CTkFrame, idx: int) -> None:
+        """卡片从右向左平滑滑入 + 分段信息显现（避免黑屏闪烁）"""
+        try:
+            final_padx = 0
+            start_padx = 108
+            steps = 20
+            duration = 22
+
+            children = list(card.winfo_children())
+
+            # 初始仅隐藏信息内容，保留卡片容器，避免黑屏闪烁
+            hidden_widgets = children[1:] if len(children) > 1 else []
+            for w in hidden_widgets:
+                try:
+                    w.grid_remove()
+                except Exception:
+                    pass
+
+            def ease_out_quint(t: float) -> float:
+                return 1 - pow(1 - t, 5)
+
+            def step(i: int):
+                t = i / steps
+                e = ease_out_quint(t)
+                current_padx = int(start_padx * (1 - e))
+                card.grid_configure(padx=(current_padx, final_padx))
+
+                if i < steps:
+                    card.after(duration, lambda: step(i + 1))
+                else:
+                    # 先显示标题区，再分段显示其它内容，形成“输出内容后置”的视觉
+                    reveal_delay = 36
+                    for j, w in enumerate(hidden_widgets):
+                        try:
+                            card.after(
+                                j * reveal_delay,
+                                lambda widget=w: widget.grid(),
+                            )
+                        except Exception:
+                            pass
+
+            card.after(min(idx * 18, 260), lambda: step(0))
+        except Exception:
+            pass
+
+    def _animate_search_status_dots(self) -> None:
+        """搜索中状态动画：正在搜索 + 动态点"""
+        if not self._is_streaming_search:
+            return
+        dots = ["", ".", "..", "..."]
+        self.status_var.set(f"🔍 正在搜索{dots[self.search_dot_step % len(dots)]}")
+        self.search_dot_step += 1
+        self.after(320, self._animate_search_status_dots)
+
+    def _show_streaming_tip_row(self) -> None:
+        """在结果列表底部显示流式搜索提示行"""
+        if not self._is_streaming_search:
+            return
+
+        tip_row = getattr(self, "_streaming_tip_row", None)
+        if tip_row is not None and tip_row.winfo_exists():
+            tip_row.grid_configure(row=len(self.current_candidates))
+            return
+
+        tip_row = ctk.CTkFrame(self.results_scroll, fg_color="transparent")
+        tip_row.grid(
+            row=len(self.current_candidates), column=0, sticky="ew", pady=(4, 2)
+        )
+        tip_row.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            tip_row,
+            text="正在持续搜索更多来源结果…",
+            font=ctk.CTkFont(size=10),
+            text_color=("#64748b", "#94a3b8"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=4)
+
+        self._streaming_tip_row = tip_row
 
 
 def main() -> None:

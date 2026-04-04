@@ -204,6 +204,7 @@ def sanitize_filename(name: str) -> str:
 
 def normalize_text(text: str) -> str:
     text = (text or "").strip().lower()
+    text = re.sub(r"</?em[^>]*>", "", text, flags=re.I)
     text = re.sub(r"\([^)]*\)", " ", text)
     text = re.sub(r"\[[^\]]*\]", " ", text)
     text = re.sub(r"[^\w\u4e00-\u9fff\u3040-\u30ff]+", " ", text)
@@ -229,13 +230,19 @@ def safe_json_from_jsonp(text: str):
     raise ValueError("Unable to parse JSON/JSONP response")
 
 
+def strip_emphasis_tags(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"</?em[^>]*>", "", text, flags=re.I)
+    return text.strip()
+
+
 def first_tag(tags: dict, *keys: str) -> str:
     for key in keys:
         value = tags.get(key)
         if isinstance(value, list) and value:
-            return str(value[0]).strip()
+            return strip_emphasis_tags(str(value[0]).strip())
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            return strip_emphasis_tags(value.strip())
     return ""
 
 
@@ -914,11 +921,15 @@ def search_kugou(query: TrackQuery) -> list[LyricsCandidate]:
                 results.append(
                     LyricsCandidate(
                         source="kugou",
-                        title=song.get("songname") or song.get("SongName") or title,
-                        artist=song.get("singername")
-                        or song.get("SingerName")
-                        or artist,
-                        album=song.get("album_name") or song.get("AlbumName") or "",
+                        title=strip_emphasis_tags(
+                            song.get("songname") or song.get("SongName") or title
+                        ),
+                        artist=strip_emphasis_tags(
+                            song.get("singername") or song.get("SingerName") or artist
+                        ),
+                        album=strip_emphasis_tags(
+                            song.get("album_name") or song.get("AlbumName") or ""
+                        ),
                         duration=duration_sec,
                         synced_lyrics=decoded,
                         plain_lyrics=remove_lrc_timestamps(decoded),
