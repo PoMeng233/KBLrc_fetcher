@@ -66,3 +66,5 @@ python lyrics_fetcher.py --title "夜に駆ける" --artist "YOASOBI"
 - `mutagen`
 - `customtkinter`
 - `tkinterdnd2`
+
+## 注意：所有代码使用AI生成
