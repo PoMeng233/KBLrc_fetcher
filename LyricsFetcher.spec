@@ -4,16 +4,16 @@ from PyInstaller.utils.hooks import collect_all
 datas = []
 binaries = []
 hiddenimports = []
-
-for package_name in ("mutagen", "customtkinter", "darkdetect"):
-    tmp_datas, tmp_binaries, tmp_hiddenimports = collect_all(package_name)
-    datas += tmp_datas
-    binaries += tmp_binaries
-    hiddenimports += tmp_hiddenimports
+tmp_ret = collect_all('mutagen')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('customtkinter')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('darkdetect')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ["lyrics_fetcher_gui.py"],
+    ['lyrics_fetcher_gui.py'],
     pathex=[],
     binaries=binaries,
     datas=datas,
@@ -33,7 +33,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="LyricsFetcher",
+    name='LyricsFetcher',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
