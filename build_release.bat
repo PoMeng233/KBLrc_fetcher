@@ -10,16 +10,45 @@ echo   Build Lyrics Fetcher Release Package
 echo ==========================================
 echo.
 
+set "PY_CMD="
+set "PY_FALLBACK=C:\Users\PoMeng\AppData\Local\Programs\Python\Python313\python.exe"
+
 where py >nul 2>nul
-if errorlevel 1 (
-    echo [ERROR] Python launcher "py" was not found.
-    echo Please install Python 3 and make sure it is added to PATH.
+if not errorlevel 1 (
+    set "PY_CMD=py -3"
+)
+
+if not defined PY_CMD (
+    where python >nul 2>nul
+    if not errorlevel 1 (
+        set "PY_CMD=python"
+    )
+)
+
+if not defined PY_CMD (
+    if exist "%PY_FALLBACK%" (
+        set "PY_CMD="%PY_FALLBACK%""
+    )
+)
+
+if not defined PY_CMD (
+    echo [ERROR] Could not find a usable Python interpreter.
+    echo.
+    echo Tried:
+    echo   1. py -3
+    echo   2. python
+    echo   3. %PY_FALLBACK%
+    echo.
+    echo Please install Python 3 or update PY_FALLBACK in this script.
     pause
     exit /b 1
 )
 
+echo [STEP] Using Python command: %PY_CMD%
+echo.
+
 echo [STEP] Checking Python...
-py -3 --version
+call %PY_CMD% --version
 if errorlevel 1 (
     echo [ERROR] Python 3 is not available.
     pause
@@ -28,21 +57,21 @@ if errorlevel 1 (
 
 echo.
 echo [STEP] Installing / upgrading build dependencies...
-py -3 -m pip install --upgrade pip
+call %PY_CMD% -m pip install --upgrade pip
 if errorlevel 1 (
     echo [ERROR] Failed to upgrade pip.
     pause
     exit /b 1
 )
 
-py -3 -m pip install -r requirements.txt
+call %PY_CMD% -m pip install -r requirements.txt
 if errorlevel 1 (
     echo [ERROR] Failed to install requirements from requirements.txt.
     pause
     exit /b 1
 )
 
-py -3 -m pip install --upgrade pyinstaller
+call %PY_CMD% -m pip install --upgrade pyinstaller
 if errorlevel 1 (
     echo [ERROR] Failed to install PyInstaller.
     pause
@@ -57,13 +86,15 @@ if exist LyricsFetcher.spec del /f /q LyricsFetcher.spec
 
 echo.
 echo [STEP] Building GUI executable with PyInstaller...
-py -3 -m PyInstaller ^
+call %PY_CMD% -m PyInstaller ^
     --noconfirm ^
     --clean ^
     --windowed ^
     --onefile ^
     --name LyricsFetcher ^
     --collect-all mutagen ^
+    --collect-all customtkinter ^
+    --collect-all darkdetect ^
     lyrics_fetcher_gui.py
 
 if errorlevel 1 (

@@ -6,15 +6,17 @@ import base64
 import json
 import re
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import quote
 
 import requests
 from mutagen import File as MutagenFile
 
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 USER_AGENT = f"LyricsFetcher/{VERSION} (+local script)"
 
 AUDIO_EXTENSIONS = {
@@ -30,11 +32,54 @@ AUDIO_EXTENSIONS = {
     ".mp4",
 }
 
+PROVIDER_CATALOG: dict[str, dict[str, object]] = {
+    "lrclib": {
+        "label": "LRCLIB",
+        "region": "global",
+        "supports_synced": True,
+        "supports_plain": True,
+    },
+    "lyricsovh": {
+        "label": "Lyrics.ovh",
+        "region": "global",
+        "supports_synced": False,
+        "supports_plain": True,
+    },
+    "kugou": {
+        "label": "酷狗音乐",
+        "region": "cn",
+        "supports_synced": True,
+        "supports_plain": True,
+    },
+    "kuwo": {
+        "label": "酷我音乐",
+        "region": "cn",
+        "supports_synced": True,
+        "supports_plain": True,
+    },
+    "netease": {
+        "label": "网易云音乐",
+        "region": "cn",
+        "supports_synced": True,
+        "supports_plain": True,
+    },
+    "qq": {
+        "label": "QQ 音乐",
+        "region": "cn",
+        "supports_synced": True,
+        "supports_plain": True,
+    },
+}
+
+DEFAULT_PROVIDERS = ["lrclib", "lyricsovh", "kugou", "kuwo", "netease", "qq"]
+
 SOURCE_PRIORITY = {
+    "lrclib": 42,
     "kugou": 40,
-    "qq": 35,
-    "netease": 30,
-    "lrclib": 25,
+    "qq": 36,
+    "netease": 34,
+    "kuwo": 32,
+    "lyricsovh": 24,
 }
 
 SESSION = requests.Session()
@@ -81,6 +126,10 @@ class LyricsCandidate:
         return bool((self.plain_lyrics or "").strip())
 
     @property
+    def has_translation(self) -> bool:
+        return bool((self.translated_lyrics or "").strip())
+
+    @property
     def has_any(self) -> bool:
         return bool(
             (self.synced_lyrics or "").strip()
@@ -109,11 +158,38 @@ class ProcessResult:
     candidates: list[LyricsCandidate] = field(default_factory=list)
 
 
+@dataclass
+class ProviderSearchStatus:
+    provider: str
+    ok: bool = False
+    result_count: int = 0
+    error: str = ""
+
+
+@dataclass
+class SearchResultBundle:
+    query: TrackQuery
+    providers: list[str]
+    all_candidates: list[LyricsCandidate] = field(default_factory=list)
+    grouped_candidates: dict[str, list[LyricsCandidate]] = field(default_factory=dict)
+    provider_status: dict[str, ProviderSearchStatus] = field(default_factory=dict)
+    best_candidate: Optional[LyricsCandidate] = None
+
+
 Logger = Optional[Callable[[str], None]]
 
 
 def default_logger(message: str) -> None:
     print(message)
+
+
+def provider_label(provider: str) -> str:
+    info = PROVIDER_CATALOG.get(provider, {})
+    return str(info.get("label") or provider)
+
+
+def available_providers() -> list[str]:
+    return list(PROVIDER_CATALOG.keys())
 
 
 def sanitize_filename(name: str) -> str:
@@ -266,7 +342,8 @@ def try_request(method: str, url: str, *, timeout: int = 12, **kwargs):
 
 def score_candidate(query: TrackQuery, cand: LyricsCandidate) -> float:
     score = SOURCE_PRIORITY.get(cand.source, 0)
-    score += 100 if cand.has_synced else 10
+    score += 100 if cand.has_synced else 12
+    score += 6 if cand.has_translation else 0
 
     if query.title:
         score += similarity(query.title, cand.title or query.title) * 40
@@ -411,6 +488,131 @@ def save_lyrics(
     return out_path
 
 
+def save_selected_candidate(
+    query: TrackQuery,
+    candidate: LyricsCandidate,
+    save_options: SaveOptions,
+) -> Path:
+    return save_lyrics(candidate, query, save_options)
+
+
+def deduplicate_candidates(
+    candidates: list[LyricsCandidate],
+    query: Optional[TrackQuery] = None,
+) -> list[LyricsCandidate]:
+    best_by_key: dict[tuple[str, str, str, str], LyricsCandidate] = {}
+
+    for cand in candidates:
+        lyrics_hint = ""
+        body = cand.synced_lyrics or cand.plain_lyrics or cand.translated_lyrics or ""
+        for line in body.splitlines():
+            line = line.strip()
+            if line:
+                lyrics_hint = normalize_text(line)[:80]
+                break
+
+        fallback_title = cand.title or (query.title if query else "")
+        fallback_artist = cand.artist or (query.artist if query else "")
+
+        key = (
+            cand.source,
+            normalize_text(fallback_title),
+            normalize_text(fallback_artist),
+            lyrics_hint,
+        )
+
+        existing = best_by_key.get(key)
+        if existing is None or cand.score > existing.score:
+            best_by_key[key] = cand
+
+    result = list(best_by_key.values())
+    result.sort(key=lambda item: item.score, reverse=True)
+    return result
+
+
+def rank_and_deduplicate_candidates(
+    candidates: list[LyricsCandidate],
+    query: TrackQuery,
+) -> list[LyricsCandidate]:
+    for cand in candidates:
+        cand.score = score_candidate(query, cand)
+    return deduplicate_candidates(candidates, query=query)
+
+
+def get_candidate_preview(
+    candidate: LyricsCandidate,
+    query: TrackQuery,
+    save_options: SaveOptions,
+) -> dict[str, object]:
+    filename = choose_output_filename(candidate, query, save_options.output_mode)
+    text = render_lrc(
+        candidate,
+        lyric_mode=save_options.lyric_mode,
+        include_metadata=save_options.include_metadata,
+        strip_timestamps=save_options.strip_timestamps,
+    )
+    return {
+        "provider": candidate.source,
+        "provider_label": provider_label(candidate.source),
+        "title": candidate.title or query.title,
+        "artist": candidate.artist or query.artist,
+        "album": candidate.album or query.album,
+        "duration": candidate.duration or query.duration,
+        "has_synced": candidate.has_synced,
+        "has_plain": candidate.has_plain,
+        "has_translation": candidate.has_translation,
+        "preview_text": text,
+        "suggested_filename": filename,
+    }
+
+
+def parse_kuwo_search_response(text: str) -> list[dict]:
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    if text.startswith("{") and "abslist" in text:
+        try:
+            data = json.loads(text)
+            return data.get("abslist") or []
+        except Exception:
+            pass
+
+    match = re.search(r"'abslist'\s*:\s*(\[[\s\S]*\])", text)
+    if not match:
+        match = re.search(r'"abslist"\s*:\s*(\[[\s\S]*\])', text)
+    if not match:
+        return []
+
+    abslist_text = match.group(1)
+
+    try:
+        fixed = abslist_text.replace("'", '"')
+        fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
+        data = json.loads(fixed)
+        return data if isinstance(data, list) else []
+    except Exception:
+        pass
+
+    results: list[dict] = []
+    for obj_text in re.findall(r"\{[\s\S]*?\}", abslist_text):
+        item: dict[str, str] = {}
+        for key, value in re.findall(r"'([^']+)'\s*:\s*'([^']*)'", obj_text):
+            item[key] = value
+        if item:
+            results.append(item)
+    return results
+
+
+def parse_kuwo_song_xml(xml_text: str) -> dict[str, str]:
+    root = ET.fromstring(xml_text)
+    data: dict[str, str] = {}
+    for child in root:
+        tag = (child.tag or "").strip()
+        data[tag] = (child.text or "").strip()
+    return data
+
+
 def search_lrclib(query: TrackQuery) -> list[LyricsCandidate]:
     results: list[LyricsCandidate] = []
 
@@ -468,6 +670,84 @@ def search_lrclib(query: TrackQuery) -> list[LyricsCandidate]:
                             plain_lyrics=item.get("plainLyrics", "") or "",
                         )
                     )
+        except Exception:
+            continue
+
+    return [item for item in results if item.has_any]
+
+
+def search_lyricsovh(query: TrackQuery) -> list[LyricsCandidate]:
+    results: list[LyricsCandidate] = []
+
+    for title, artist in query.search_variants:
+        if not title:
+            continue
+
+        try:
+            if artist:
+                response = try_request(
+                    "GET",
+                    f"https://api.lyrics.ovh/v1/{quote(artist)}/{quote(title)}",
+                    headers={"User-Agent": USER_AGENT},
+                )
+                data = response.json()
+                lyrics = data.get("lyrics", "") or ""
+                if lyrics.strip():
+                    results.append(
+                        LyricsCandidate(
+                            source="lyricsovh",
+                            title=title,
+                            artist=artist,
+                            album=query.album,
+                            duration=query.duration,
+                            plain_lyrics=clean_plain_lyrics(lyrics),
+                        )
+                    )
+                    continue
+        except Exception:
+            pass
+
+        try:
+            keyword = " ".join(part for part in [artist, title] if part).strip()
+            suggest_response = try_request(
+                "GET",
+                f"https://api.lyrics.ovh/suggest/{quote(keyword or title)}",
+                headers={"User-Agent": USER_AGENT},
+            )
+            suggest_data = suggest_response.json()
+            items = (suggest_data.get("data") or [])[:5]
+
+            for item in items:
+                cand_title = item.get("title", "") or title
+                artist_obj = item.get("artist") or {}
+                cand_artist = (
+                    artist_obj.get("name", "")
+                    if isinstance(artist_obj, dict)
+                    else artist
+                )
+                if not cand_title or not cand_artist:
+                    continue
+
+                try:
+                    lyric_response = try_request(
+                        "GET",
+                        f"https://api.lyrics.ovh/v1/{quote(cand_artist)}/{quote(cand_title)}",
+                        headers={"User-Agent": USER_AGENT},
+                    )
+                    lyric_data = lyric_response.json()
+                    lyrics = lyric_data.get("lyrics", "") or ""
+                    if lyrics.strip():
+                        results.append(
+                            LyricsCandidate(
+                                source="lyricsovh",
+                                title=cand_title,
+                                artist=cand_artist,
+                                album=query.album,
+                                plain_lyrics=clean_plain_lyrics(lyrics),
+                            )
+                        )
+                except Exception:
+                    continue
         except Exception:
             continue
 
@@ -572,6 +852,107 @@ def search_kugou(query: TrackQuery) -> list[LyricsCandidate]:
                         else None,
                         synced_lyrics=decoded,
                         plain_lyrics=remove_lrc_timestamps(decoded),
+                    )
+                )
+        except Exception:
+            continue
+
+    return [item for item in results if item.has_any]
+
+
+def search_kuwo(query: TrackQuery) -> list[LyricsCandidate]:
+    results: list[LyricsCandidate] = []
+    headers = {"Referer": "https://www.kuwo.cn/", "User-Agent": USER_AGENT}
+
+    for title, artist in query.search_variants:
+        keyword = " ".join(part for part in [title, artist] if part).strip()
+        if not keyword:
+            continue
+
+        try:
+            response = try_request(
+                "GET",
+                "https://search.kuwo.cn/r.s",
+                params={
+                    "all": keyword,
+                    "ft": "music",
+                    "itemset": "web_2013",
+                    "client": "kt",
+                    "pn": 0,
+                    "rn": 6,
+                    "rformat": "json",
+                    "encoding": "utf8",
+                },
+                headers=headers,
+            )
+            songs = parse_kuwo_search_response(response.text)[:5]
+            for song in songs:
+                rid = song.get("MUSICRID") or song.get("rid")
+                if not rid:
+                    continue
+
+                song_response = try_request(
+                    "GET",
+                    "https://player.kuwo.cn/webmusic/st/getNewMuiseByRid",
+                    params={"rid": rid},
+                    headers=headers,
+                )
+
+                song_data = parse_kuwo_song_xml(song_response.text)
+                lrc_key = song_data.get("lyric", "")
+                trans_key = song_data.get("lyric_zz", "")
+
+                synced = ""
+                translated = ""
+                if lrc_key:
+                    try:
+                        lrc_response = try_request(
+                            "GET",
+                            f"https://newlyric.kuwo.cn/newlyric.lrc?{lrc_key}",
+                            headers=headers,
+                        )
+                        synced = lrc_response.text.strip()
+                    except Exception:
+                        synced = ""
+
+                if trans_key:
+                    try:
+                        trans_response = try_request(
+                            "GET",
+                            f"https://newlyric.kuwo.cn/newlyric.lrc?{trans_key}",
+                            headers=headers,
+                        )
+                        translated = trans_response.text.strip()
+                    except Exception:
+                        translated = ""
+
+                if not synced and not translated:
+                    continue
+
+                duration = None
+                duration_raw = song.get("DURATION") or song_data.get("songTimeMinutes")
+                if duration_raw:
+                    if str(duration_raw).isdigit():
+                        duration = int(duration_raw)
+                    else:
+                        time_match = re.match(r"(\d+):(\d+)", str(duration_raw))
+                        if time_match:
+                            duration = int(time_match.group(1)) * 60 + int(
+                                time_match.group(2)
+                            )
+
+                results.append(
+                    LyricsCandidate(
+                        source="kuwo",
+                        title=song.get("SONGNAME") or song_data.get("name") or title,
+                        artist=song.get("ARTIST") or song_data.get("artist") or artist,
+                        album=song.get("ALBUM") or song_data.get("special") or "",
+                        duration=duration,
+                        synced_lyrics=synced,
+                        plain_lyrics=remove_lrc_timestamps(synced)
+                        if synced
+                        else clean_plain_lyrics(translated),
+                        translated_lyrics=translated,
                     )
                 )
         except Exception:
@@ -763,10 +1144,33 @@ def search_qq(query: TrackQuery) -> list[LyricsCandidate]:
 
 PROVIDER_FUNCS: dict[str, Callable[[TrackQuery], list[LyricsCandidate]]] = {
     "lrclib": search_lrclib,
+    "lyricsovh": search_lyricsovh,
     "kugou": search_kugou,
+    "kuwo": search_kuwo,
     "netease": search_netease,
     "qq": search_qq,
 }
+
+
+def search_single_provider(
+    query: TrackQuery,
+    provider: str,
+) -> tuple[list[LyricsCandidate], ProviderSearchStatus]:
+    func = PROVIDER_FUNCS.get(provider)
+    status = ProviderSearchStatus(provider=provider)
+
+    if not func:
+        status.error = "未知歌词源"
+        return [], status
+
+    try:
+        items = func(query)
+        status.ok = True
+        status.result_count = len(items)
+        return items, status
+    except Exception as exc:
+        status.error = str(exc)
+        return [], status
 
 
 def collect_candidates(
@@ -783,18 +1187,63 @@ def collect_candidates(
             log(f"[WARN] 未知歌词源: {provider}")
             continue
 
-        log(f"[INFO] 搜索 {provider}: {query.title} / {query.artist}")
+        log(f"[INFO] 搜索 {provider_label(provider)}: {query.title} / {query.artist}")
         try:
             items = func(query)
             for item in items:
                 item.score = score_candidate(query, item)
                 candidates.append(item)
-            log(f"[INFO] {provider} 返回 {len(items)} 条结果")
+            log(f"[INFO] {provider_label(provider)} 返回 {len(items)} 条结果")
         except Exception as exc:
-            log(f"[WARN] {provider} 搜索失败: {exc}")
+            log(f"[WARN] {provider_label(provider)} 搜索失败: {exc}")
 
+    candidates = deduplicate_candidates(candidates, query=query)
     candidates.sort(key=lambda item: item.score, reverse=True)
     return candidates
+
+
+def search_candidates_by_source(
+    query: TrackQuery,
+    providers: list[str],
+    prefer_synced: bool = True,
+    logger: Logger = None,
+) -> SearchResultBundle:
+    log = logger or (lambda _: None)
+    normalized_providers = [p for p in providers if p in PROVIDER_FUNCS]
+    bundle = SearchResultBundle(query=query, providers=normalized_providers)
+
+    all_items: list[LyricsCandidate] = []
+
+    for provider in normalized_providers:
+        log(f"[INFO] 搜索 {provider_label(provider)}: {query.title} / {query.artist}")
+        items, status = search_single_provider(query, provider)
+        bundle.provider_status[provider] = status
+
+        if status.error:
+            log(f"[WARN] {provider_label(provider)} 搜索失败: {status.error}")
+        else:
+            log(f"[INFO] {provider_label(provider)} 返回 {len(items)} 条结果")
+
+        for item in items:
+            item.score = score_candidate(query, item)
+            all_items.append(item)
+
+    ranked = rank_and_deduplicate_candidates(all_items, query)
+    grouped: dict[str, list[LyricsCandidate]] = {}
+    for provider in normalized_providers:
+        grouped[provider] = [item for item in ranked if item.source == provider]
+
+    bundle.all_candidates = ranked
+    bundle.grouped_candidates = grouped
+
+    if ranked:
+        if prefer_synced:
+            synced = [item for item in ranked if item.has_synced]
+            bundle.best_candidate = synced[0] if synced else ranked[0]
+        else:
+            bundle.best_candidate = ranked[0]
+
+    return bundle
 
 
 def choose_best_candidate(
@@ -803,17 +1252,13 @@ def choose_best_candidate(
     prefer_synced: bool = True,
     logger: Logger = None,
 ) -> tuple[Optional[LyricsCandidate], list[LyricsCandidate]]:
-    candidates = collect_candidates(query, providers, logger=logger)
-    if not candidates:
-        return None, []
-
-    if prefer_synced:
-        synced = [item for item in candidates if item.has_synced]
-        if synced:
-            synced.sort(key=lambda item: item.score, reverse=True)
-            return synced[0], candidates
-
-    return candidates[0], candidates
+    bundle = search_candidates_by_source(
+        query,
+        providers,
+        prefer_synced=prefer_synced,
+        logger=logger,
+    )
+    return bundle.best_candidate, bundle.all_candidates
 
 
 def find_audio_files(path: Path, recursive: bool = True) -> list[Path]:
@@ -837,12 +1282,14 @@ def process_query(
     prefer_synced = (
         save_options.lyric_mode != "plain" and not save_options.strip_timestamps
     )
-    best, candidates = choose_best_candidate(
+    bundle = search_candidates_by_source(
         query,
         providers,
         prefer_synced=prefer_synced,
         logger=logger,
     )
+    best = bundle.best_candidate
+    candidates = bundle.all_candidates
 
     if not best:
         return ProcessResult(
@@ -853,12 +1300,12 @@ def process_query(
         )
 
     log(
-        f"[OK] 选中来源: {best.source} | {best.title} - {best.artist} | "
-        f"synced={best.has_synced}"
+        f"[OK] 选中来源: {provider_label(best.source)} | "
+        f"{best.title} - {best.artist} | synced={best.has_synced}"
     )
 
     try:
-        output_path = save_lyrics(best, query, save_options)
+        output_path = save_selected_candidate(query, best, save_options)
     except FileExistsError as exc:
         return ProcessResult(
             query=query,
@@ -919,7 +1366,8 @@ def parse_provider_list(raw: str) -> list[str]:
     providers = [
         item.strip().lower() for item in (raw or "").split(",") if item.strip()
     ]
-    return providers or ["lrclib", "kugou", "netease", "qq"]
+    normalized = [item for item in providers if item in PROVIDER_FUNCS]
+    return normalized or list(DEFAULT_PROVIDERS)
 
 
 def build_save_options_from_args(args: argparse.Namespace) -> SaveOptions:
@@ -952,7 +1400,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dir", help="批量处理文件夹")
     parser.add_argument(
         "--providers",
-        default="lrclib,kugou,netease,qq",
+        default=",".join(DEFAULT_PROVIDERS),
         help="歌词源，逗号分隔",
     )
     parser.add_argument(
@@ -998,9 +1446,21 @@ def create_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def cli_out(message: str, *, error: bool = False) -> None:
+    print(message, file=sys.stderr if error else sys.stdout)
+
+
 def cli_print_result(result: ProcessResult) -> None:
     prefix = "[OK]" if result.success else "[FAIL]"
-    print(f"{prefix} {result.message}")
+    cli_out(f"{prefix} {result.message}", error=not result.success)
+
+
+def cli_print_preview(best: LyricsCandidate, candidates: list[LyricsCandidate]) -> None:
+    cli_out(
+        f"[OK] 预览来源: {provider_label(best.source)} | "
+        f"{best.title} - {best.artist} | synced={best.has_synced} | "
+        f"candidates={len(candidates)}"
+    )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1013,11 +1473,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.file:
         file_path = Path(args.file).expanduser().resolve()
         if not file_path.exists():
-            print(f"[ERROR] 文件不存在: {file_path}", file=sys.stderr)
+            cli_out(f"[ERROR] 文件不存在: {file_path}", error=True)
             return 2
 
         query = read_audio_metadata(file_path)
-        print(f"[INFO] 搜索: {query.title} / {query.artist}")
+        cli_out(f"[INFO] 搜索: {query.title} / {query.artist}")
 
         if args.dry_run:
             best, candidates = choose_best_candidate(
@@ -1030,12 +1490,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                 logger=default_logger,
             )
             if not best:
-                print(f"[FAIL] 未找到歌词: {query.title} - {query.artist}")
+                cli_out(
+                    f"[FAIL] 未找到歌词: {query.title} - {query.artist}", error=True
+                )
                 return 1
-            print(
-                f"[OK] 预览来源: {best.source} | {best.title} - {best.artist} | "
-                f"synced={best.has_synced} | candidates={len(candidates)}"
-            )
+            cli_print_preview(best, candidates)
             return 0
 
         result = process_query(query, providers, save_options, logger=default_logger)
@@ -1045,21 +1504,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.dir:
         directory = Path(args.dir).expanduser().resolve()
         if not directory.exists():
-            print(f"[ERROR] 文件夹不存在: {directory}", file=sys.stderr)
+            cli_out(f"[ERROR] 文件夹不存在: {directory}", error=True)
             return 2
 
         files = find_audio_files(directory, recursive=not args.non_recursive)
         if not files:
-            print("[ERROR] 没找到音频文件", file=sys.stderr)
+            cli_out("[ERROR] 没找到音频文件", error=True)
             return 2
 
-        print(f"[INFO] 共找到 {len(files)} 个音频文件")
+        cli_out(f"[INFO] 共找到 {len(files)} 个音频文件")
         failed = 0
 
         for index, file_path in enumerate(files, start=1):
-            print(f"\n=== [{index}/{len(files)}] 处理: {file_path.name} ===")
+            cli_out(f"\n=== [{index}/{len(files)}] 处理: {file_path.name} ===")
             query = read_audio_metadata(file_path)
-            print(f"[INFO] 搜索: {query.title} / {query.artist}")
+            cli_out(f"[INFO] 搜索: {query.title} / {query.artist}")
 
             if args.dry_run:
                 best, candidates = choose_best_candidate(
@@ -1072,13 +1531,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                     logger=default_logger,
                 )
                 if not best:
-                    print(f"[FAIL] 未找到歌词: {query.title} - {query.artist}")
+                    cli_out(
+                        f"[FAIL] 未找到歌词: {query.title} - {query.artist}",
+                        error=True,
+                    )
                     failed += 1
                     continue
-                print(
-                    f"[OK] 预览来源: {best.source} | {best.title} - {best.artist} | "
-                    f"synced={best.has_synced} | candidates={len(candidates)}"
-                )
+                cli_print_preview(best, candidates)
                 continue
 
             result = process_query(
@@ -1089,10 +1548,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 failed += 1
 
         if failed:
-            print(f"\n[SUMMARY] 完成，但有 {failed} 项失败。", file=sys.stderr)
+            cli_out(f"\n[SUMMARY] 完成，但有 {failed} 项失败。", error=True)
             return 1
 
-        print("\n[SUMMARY] 全部完成。")
+        cli_out("\n[SUMMARY] 全部完成。")
         return 0
 
     if args.title:
@@ -1102,7 +1561,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             album=args.album,
             duration=args.duration,
         )
-        print(f"[INFO] 搜索: {query.title} / {query.artist}")
+        cli_out(f"[INFO] 搜索: {query.title} / {query.artist}")
 
         if args.dry_run:
             best, candidates = choose_best_candidate(
@@ -1115,12 +1574,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                 logger=default_logger,
             )
             if not best:
-                print(f"[FAIL] 未找到歌词: {query.title} - {query.artist}")
+                cli_out(
+                    f"[FAIL] 未找到歌词: {query.title} - {query.artist}", error=True
+                )
                 return 1
-            print(
-                f"[OK] 预览来源: {best.source} | {best.title} - {best.artist} | "
-                f"synced={best.has_synced} | candidates={len(candidates)}"
-            )
+            cli_print_preview(best, candidates)
             return 0
 
         result = process_query(query, providers, save_options, logger=default_logger)
