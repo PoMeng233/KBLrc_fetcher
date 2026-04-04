@@ -784,12 +784,16 @@ def search_lyricsovh(query: TrackQuery) -> list[LyricsCandidate]:
 
 def search_kugou(query: TrackQuery) -> list[LyricsCandidate]:
     results: list[LyricsCandidate] = []
+    headers = {"Referer": "https://www.kugou.com/", "User-Agent": USER_AGENT}
 
     for title, artist in query.search_variants:
         keyword = f"{artist} - {title}".strip(" -")
         if not keyword:
             continue
 
+        songs: list[dict] = []
+
+        # endpoint 1: mobilecdn
         try:
             response = try_request(
                 "GET",
@@ -798,28 +802,59 @@ def search_kugou(query: TrackQuery) -> list[LyricsCandidate]:
                     "format": "json",
                     "keyword": keyword,
                     "page": 1,
-                    "pagesize": 8,
+                    "pagesize": 10,
                     "showtype": 1,
                 },
-                headers={"Referer": "https://www.kugou.com/", "User-Agent": USER_AGENT},
+                headers=headers,
             )
             data = response.json()
-            songs = (((data or {}).get("data") or {}).get("info") or [])[:5]
+            songs.extend((((data or {}).get("data") or {}).get("info") or [])[:8])
+        except Exception:
+            pass
 
-            for song in songs:
-                song_hash = (
-                    song.get("hash") or song.get("320hash") or song.get("sqhash")
+        # endpoint 2: legacy search api fallback
+        if not songs:
+            try:
+                response = try_request(
+                    "GET",
+                    "https://songsearch.kugou.com/song_search_v2",
+                    params={
+                        "keyword": keyword,
+                        "page": 1,
+                        "pagesize": 10,
+                        "platform": "WebFilter",
+                        "tag": "em",
+                    },
+                    headers=headers,
                 )
-                if not song_hash:
-                    continue
+                data = response.json()
+                songs.extend((((data or {}).get("data") or {}).get("lists") or [])[:8])
+            except Exception:
+                pass
 
-                duration_ms = ""
-                if song.get("duration"):
-                    try:
-                        duration_ms = int(song["duration"]) * 1000
-                    except Exception:
-                        duration_ms = ""
+        for song in songs:
+            song_hash = (
+                song.get("hash")
+                or song.get("FileHash")
+                or song.get("320hash")
+                or song.get("sqhash")
+            )
+            if not song_hash:
+                continue
 
+            duration_ms = ""
+            duration_sec = None
+            duration_val = song.get("duration") or song.get("Duration")
+            if duration_val:
+                try:
+                    duration_sec = int(duration_val)
+                    duration_ms = duration_sec * 1000
+                except Exception:
+                    duration_sec = None
+                    duration_ms = ""
+
+            candidates = []
+            try:
                 candidate_response = try_request(
                     "GET",
                     "https://krcs.kugou.com/search",
@@ -827,40 +862,43 @@ def search_kugou(query: TrackQuery) -> list[LyricsCandidate]:
                         "ver": 1,
                         "man": "yes",
                         "client": "mobi",
-                        "keyword": "",
+                        "keyword": keyword,
                         "duration": duration_ms,
                         "hash": song_hash,
-                        "album_audio_id": "",
+                        "album_audio_id": song.get("album_audio_id", ""),
                     },
-                    headers={
-                        "Referer": "https://www.kugou.com/",
-                        "User-Agent": USER_AGENT,
-                    },
+                    headers=headers,
                 )
                 candidate_data = candidate_response.json()
                 candidates = (candidate_data or {}).get("candidates") or []
-                if not candidates:
-                    continue
+            except Exception:
+                candidates = []
 
-                item = candidates[0]
-                lyric_response = try_request(
-                    "GET",
-                    "https://lyrics.kugou.com/download",
-                    params={
-                        "ver": 1,
-                        "client": "pc",
-                        "id": item.get("id"),
-                        "accesskey": item.get("accesskey"),
-                        "fmt": "lrc",
-                        "charset": "utf8",
-                    },
-                    headers={
-                        "Referer": "https://www.kugou.com/",
-                        "User-Agent": USER_AGENT,
-                    },
-                )
-                lyric_data = lyric_response.json()
-                content = lyric_data.get("content", "")
+            if not candidates:
+                continue
+
+            # try several candidate rows for better compatibility
+            for item in candidates[:3]:
+                content = ""
+                try:
+                    lyric_response = try_request(
+                        "GET",
+                        "https://lyrics.kugou.com/download",
+                        params={
+                            "ver": 1,
+                            "client": "pc",
+                            "id": item.get("id"),
+                            "accesskey": item.get("accesskey"),
+                            "fmt": "lrc",
+                            "charset": "utf8",
+                        },
+                        headers=headers,
+                    )
+                    lyric_data = lyric_response.json()
+                    content = lyric_data.get("content", "") or ""
+                except Exception:
+                    content = ""
+
                 if not content:
                     continue
 
@@ -869,21 +907,24 @@ def search_kugou(query: TrackQuery) -> list[LyricsCandidate]:
                 except Exception:
                     decoded = content
 
+                decoded = (decoded or "").strip()
+                if not decoded:
+                    continue
+
                 results.append(
                     LyricsCandidate(
                         source="kugou",
-                        title=song.get("songname") or title,
-                        artist=song.get("singername") or artist,
-                        album=song.get("album_name") or "",
-                        duration=int(song.get("duration"))
-                        if song.get("duration")
-                        else None,
+                        title=song.get("songname") or song.get("SongName") or title,
+                        artist=song.get("singername")
+                        or song.get("SingerName")
+                        or artist,
+                        album=song.get("album_name") or song.get("AlbumName") or "",
+                        duration=duration_sec,
                         synced_lyrics=decoded,
                         plain_lyrics=remove_lrc_timestamps(decoded),
                     )
                 )
-        except Exception:
-            continue
+                break
 
     return [item for item in results if item.has_any]
 
@@ -897,6 +938,9 @@ def search_kuwo(query: TrackQuery) -> list[LyricsCandidate]:
         if not keyword:
             continue
 
+        songs: list[dict] = []
+
+        # endpoint 1: legacy search
         try:
             response = try_request(
                 "GET",
@@ -907,84 +951,156 @@ def search_kuwo(query: TrackQuery) -> list[LyricsCandidate]:
                     "itemset": "web_2013",
                     "client": "kt",
                     "pn": 0,
-                    "rn": 6,
+                    "rn": 8,
                     "rformat": "json",
                     "encoding": "utf8",
                 },
                 headers=headers,
             )
-            songs = parse_kuwo_search_response(response.text)[:5]
-            for song in songs:
-                rid = song.get("MUSICRID") or song.get("rid")
-                if not rid:
-                    continue
+            songs.extend(parse_kuwo_search_response(response.text)[:8])
+        except Exception:
+            pass
 
+        # endpoint 2: www search fallback
+        if not songs:
+            try:
+                response = try_request(
+                    "GET",
+                    "https://www.kuwo.cn/api/www/search/searchMusicBykeyWord",
+                    params={
+                        "key": keyword,
+                        "pn": 1,
+                        "rn": 10,
+                        "httpsStatus": 1,
+                    },
+                    headers={**headers, "csrf": "", "Cookie": "kw_token="},
+                )
+                data = response.json()
+                songs.extend((((data or {}).get("data") or {}).get("list") or [])[:8])
+            except Exception:
+                pass
+
+        for song in songs:
+            rid = song.get("MUSICRID") or song.get("rid") or song.get("musicrid") or ""
+            rid = str(rid).replace("MUSIC_", "").strip()
+            if not rid:
+                continue
+
+            synced = ""
+            translated = ""
+            song_data: dict[str, str] = {}
+
+            # primary metadata endpoint
+            try:
                 song_response = try_request(
                     "GET",
                     "https://player.kuwo.cn/webmusic/st/getNewMuiseByRid",
                     params={"rid": rid},
                     headers=headers,
                 )
-
                 song_data = parse_kuwo_song_xml(song_response.text)
-                lrc_key = song_data.get("lyric", "")
-                trans_key = song_data.get("lyric_zz", "")
+            except Exception:
+                song_data = {}
 
-                synced = ""
-                translated = ""
-                if lrc_key:
-                    try:
-                        lrc_response = try_request(
-                            "GET",
-                            f"https://newlyric.kuwo.cn/newlyric.lrc?{lrc_key}",
-                            headers=headers,
-                        )
-                        synced = lrc_response.text.strip()
-                    except Exception:
-                        synced = ""
+            lrc_key = song_data.get("lyric", "")
+            trans_key = song_data.get("lyric_zz", "")
 
-                if trans_key:
-                    try:
-                        trans_response = try_request(
-                            "GET",
-                            f"https://newlyric.kuwo.cn/newlyric.lrc?{trans_key}",
-                            headers=headers,
-                        )
-                        translated = trans_response.text.strip()
-                    except Exception:
-                        translated = ""
-
-                if not synced and not translated:
-                    continue
-
-                duration = None
-                duration_raw = song.get("DURATION") or song_data.get("songTimeMinutes")
-                if duration_raw:
-                    if str(duration_raw).isdigit():
-                        duration = int(duration_raw)
-                    else:
-                        time_match = re.match(r"(\d+):(\d+)", str(duration_raw))
-                        if time_match:
-                            duration = int(time_match.group(1)) * 60 + int(
-                                time_match.group(2)
-                            )
-
-                results.append(
-                    LyricsCandidate(
-                        source="kuwo",
-                        title=song.get("SONGNAME") or song_data.get("name") or title,
-                        artist=song.get("ARTIST") or song_data.get("artist") or artist,
-                        album=song.get("ALBUM") or song_data.get("special") or "",
-                        duration=duration,
-                        synced_lyrics=synced,
-                        plain_lyrics=remove_lrc_timestamps(synced)
-                        if synced
-                        else clean_plain_lyrics(translated),
-                        translated_lyrics=translated,
+            if lrc_key:
+                try:
+                    lrc_response = try_request(
+                        "GET",
+                        f"https://newlyric.kuwo.cn/newlyric.lrc?{lrc_key}",
+                        headers=headers,
                     )
+                    synced = lrc_response.text.strip()
+                except Exception:
+                    synced = ""
+
+            if trans_key:
+                try:
+                    trans_response = try_request(
+                        "GET",
+                        f"https://newlyric.kuwo.cn/newlyric.lrc?{trans_key}",
+                        headers=headers,
+                    )
+                    translated = trans_response.text.strip()
+                except Exception:
+                    translated = ""
+
+            # fallback lyric endpoint for many tracks
+            if not synced and not translated:
+                try:
+                    lrc_api = try_request(
+                        "GET",
+                        "https://m.kuwo.cn/newh5/singles/songinfoandlrc",
+                        params={"musicId": rid},
+                        headers=headers,
+                    )
+                    lrc_data = lrc_api.json()
+                    lrclist = (
+                        ((lrc_data or {}).get("data") or {}).get("lrclist")
+                    ) or []
+                    if isinstance(lrclist, list) and lrclist:
+                        synced_lines: list[str] = []
+                        for row in lrclist:
+                            line = (row.get("lineLyric") or "").strip()
+                            tval = str(row.get("time") or "0").strip()
+                            if not line:
+                                continue
+                            try:
+                                sec = float(tval)
+                            except Exception:
+                                sec = 0.0
+                            mm = int(sec // 60)
+                            ss = sec - mm * 60
+                            synced_lines.append(f"[{mm:02d}:{ss:05.2f}]{line}")
+                        synced = "\n".join(synced_lines).strip()
+                except Exception:
+                    pass
+
+            if not synced and not translated:
+                continue
+
+            duration = None
+            duration_raw = (
+                song.get("DURATION")
+                or song_data.get("songTimeMinutes")
+                or song.get("duration")
+                or song.get("songTimeMinutes")
+            )
+            if duration_raw:
+                if str(duration_raw).isdigit():
+                    duration = int(duration_raw)
+                else:
+                    time_match = re.match(r"(\d+):(\d+)", str(duration_raw))
+                    if time_match:
+                        duration = int(time_match.group(1)) * 60 + int(
+                            time_match.group(2)
+                        )
+
+            results.append(
+                LyricsCandidate(
+                    source="kuwo",
+                    title=song.get("SONGNAME")
+                    or song.get("name")
+                    or song_data.get("name")
+                    or title,
+                    artist=song.get("ARTIST")
+                    or song.get("artist")
+                    or song_data.get("artist")
+                    or artist,
+                    album=song.get("ALBUM")
+                    or song.get("album")
+                    or song_data.get("special")
+                    or "",
+                    duration=duration,
+                    synced_lyrics=synced,
+                    plain_lyrics=remove_lrc_timestamps(synced)
+                    if synced
+                    else clean_plain_lyrics(translated),
+                    translated_lyrics=translated,
                 )
-        except Exception:
-            continue
+            )
 
     return [item for item in results if item.has_any]
 
@@ -1076,6 +1192,9 @@ def search_qq(query: TrackQuery) -> list[LyricsCandidate]:
         if not keyword:
             continue
 
+        songs: list[dict] = []
+
+        # endpoint 1: classic search
         try:
             response = try_request(
                 "GET",
@@ -1093,7 +1212,7 @@ def search_qq(query: TrackQuery) -> list[LyricsCandidate]:
                     "lossless": 0,
                     "flag_qc": 0,
                     "p": 1,
-                    "n": 8,
+                    "n": 10,
                     "w": keyword,
                     "g_tk": 5381,
                     "format": "json",
@@ -1106,15 +1225,53 @@ def search_qq(query: TrackQuery) -> list[LyricsCandidate]:
                 headers=headers,
             )
             data = safe_json_from_jsonp(response.text)
-            songs = (
-                (((data or {}).get("data") or {}).get("song") or {}).get("list") or []
-            )[:5]
+            songs.extend(
+                (
+                    (((data or {}).get("data") or {}).get("song") or {}).get("list")
+                    or []
+                )[:8]
+            )
+        except Exception:
+            pass
 
-            for song in songs:
-                songmid = song.get("mid") or song.get("songmid")
-                if not songmid:
-                    continue
+        # endpoint 2: smartbox fallback
+        if not songs:
+            try:
+                response = try_request(
+                    "GET",
+                    "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg",
+                    params={
+                        "key": keyword,
+                        "format": "json",
+                        "inCharset": "utf-8",
+                        "outCharset": "utf-8",
+                        "platform": "yqq.json",
+                        "g_tk": 5381,
+                    },
+                    headers=headers,
+                )
+                data = safe_json_from_jsonp(response.text)
+                songs.extend(
+                    (
+                        (((data or {}).get("data") or {}).get("song") or {}).get(
+                            "itemlist"
+                        )
+                        or []
+                    )[:8]
+                )
+            except Exception:
+                pass
 
+        for song in songs:
+            songmid = song.get("mid") or song.get("songmid")
+            if not songmid:
+                continue
+
+            lrc = ""
+            trans = ""
+
+            # endpoint A: json lyric with plain text
+            try:
                 lyric_response = try_request(
                     "GET",
                     "https://i.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg",
@@ -1134,38 +1291,78 @@ def search_qq(query: TrackQuery) -> list[LyricsCandidate]:
                 lyric_data = safe_json_from_jsonp(lyric_response.text)
                 lrc = lyric_data.get("lyric", "") or ""
                 trans = lyric_data.get("trans", "") or ""
-                if not lrc and not trans:
-                    continue
+            except Exception:
+                lrc = ""
+                trans = ""
 
-                singers = ", ".join(
-                    item.get("name", "")
-                    for item in song.get("singer", [])
-                    if item.get("name")
-                )
-                album = (
-                    (song.get("album") or {}).get("name", "")
-                    if isinstance(song.get("album"), dict)
-                    else ""
-                )
-                interval = song.get("interval")
-                duration = int(interval) if interval else None
-
-                results.append(
-                    LyricsCandidate(
-                        source="qq",
-                        title=song.get("title") or title,
-                        artist=singers or artist,
-                        album=album,
-                        duration=duration,
-                        synced_lyrics=lrc,
-                        translated_lyrics=trans,
-                        plain_lyrics=remove_lrc_timestamps(lrc)
-                        if lrc
-                        else clean_plain_lyrics(trans),
+            # endpoint B: fallback base64 lyric
+            if not lrc and not trans:
+                try:
+                    lyric_response = try_request(
+                        "GET",
+                        "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric.fcg",
+                        params={
+                            "songmid": songmid,
+                            "format": "json",
+                            "nobase64": 0,
+                            "platform": "yqq",
+                            "g_tk": 5381,
+                        },
+                        headers=headers,
                     )
+                    lyric_data = safe_json_from_jsonp(lyric_response.text)
+                    lrc_b64 = lyric_data.get("lyric", "") or ""
+                    trans_b64 = lyric_data.get("trans", "") or ""
+                    if lrc_b64:
+                        try:
+                            lrc = base64.b64decode(lrc_b64).decode(
+                                "utf-8", errors="ignore"
+                            )
+                        except Exception:
+                            lrc = ""
+                    if trans_b64:
+                        try:
+                            trans = base64.b64decode(trans_b64).decode(
+                                "utf-8", errors="ignore"
+                            )
+                        except Exception:
+                            trans = ""
+                except Exception:
+                    pass
+
+            if not lrc and not trans:
+                continue
+
+            singers = ", ".join(
+                item.get("name", "")
+                for item in song.get("singer", [])
+                if isinstance(item, dict) and item.get("name")
+            )
+            if not singers and song.get("singer"):
+                singers = str(song.get("singer"))
+
+            album = (
+                (song.get("album") or {}).get("name", "")
+                if isinstance(song.get("album"), dict)
+                else (song.get("albumName") or "")
+            )
+            interval = song.get("interval")
+            duration = int(interval) if str(interval).isdigit() else None
+
+            results.append(
+                LyricsCandidate(
+                    source="qq",
+                    title=song.get("title") or song.get("name") or title,
+                    artist=singers or artist,
+                    album=album,
+                    duration=duration,
+                    synced_lyrics=lrc,
+                    translated_lyrics=trans,
+                    plain_lyrics=remove_lrc_timestamps(lrc)
+                    if lrc
+                    else clean_plain_lyrics(trans),
                 )
-        except Exception:
-            continue
+            )
 
     return [item for item in results if item.has_any]
 

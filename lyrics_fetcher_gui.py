@@ -73,8 +73,8 @@ class LyricsFetcherGUI(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title("KB歌词搜索 - KBlrc_fetcher")
-        self.geometry("1200x800")
-        self.minsize(900, 600)
+        self.geometry("1220x800")
+        self.minsize(980, 640)
 
         # 配置网格权重，支持窗口缩放
         self.grid_rowconfigure(0, weight=0)  # 顶部
@@ -137,15 +137,15 @@ class LyricsFetcherGUI(ctk.CTk):
         # 设置背景
         self.configure(fg_color=("#f8fafb", "#0a0e14"))
 
-        # 顶部栏
+        # 顶部工具栏
         self._build_header()
 
-        # 主容器 - 左右两栏
+        # 主容器 - 左右两栏（响应式留白）
         main_container = ctk.CTkFrame(self, fg_color="transparent")
-        main_container.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
+        main_container.grid(row=1, column=0, sticky="nsew", padx=12, pady=10)
         main_container.grid_rowconfigure(0, weight=1)
-        main_container.grid_columnconfigure(0, weight=0, minsize=320)
-        main_container.grid_columnconfigure(1, weight=1, minsize=400)
+        main_container.grid_columnconfigure(0, weight=0, minsize=350)
+        main_container.grid_columnconfigure(1, weight=1, minsize=560)
 
         # 左侧面板
         self._build_left_panel(main_container)
@@ -158,86 +158,140 @@ class LyricsFetcherGUI(ctk.CTk):
         self._build_drag_overlay()
 
     def _build_header(self) -> None:
-        header = GlassFrame(self)
-        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
+        header = GlassFrame(self, bg_color=("#f8fafc", "#0a0f1a"))
+        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
         header.grid_columnconfigure(0, weight=1)
+        header.grid_columnconfigure(1, weight=0)
+        header.grid_columnconfigure(2, weight=0)
+        header.grid_columnconfigure(3, weight=0)
 
-        title = ctk.CTkLabel(
-            header, text="🎵 KB歌词搜索", font=ctk.CTkFont(size=24, weight="bold")
-        )
-        title.grid(row=0, column=0, sticky="w", padx=16, pady=12)
-
-        subtitle = ctk.CTkLabel(
+        self.quick_search_entry = ctk.CTkEntry(
             header,
-            text="多源歌词搜索 • 拖放文件快速识别 • 现代化界面",
-            font=ctk.CTkFont(size=12),
-            text_color=("#6b7280", "#9ca3af"),
+            placeholder_text="快速搜索：输入歌曲名后回车",
+            height=34,
+            corner_radius=9,
         )
-        subtitle.grid(row=1, column=0, sticky="w", padx=16, pady=(0, 12))
+        self.quick_search_entry.grid(
+            row=0, column=0, sticky="ew", padx=(12, 8), pady=10
+        )
+        self.quick_search_entry.bind("<Return>", self._on_quick_search_enter)
+
+        self.quick_search_btn = ModernButton(
+            header,
+            text="搜索",
+            width=72,
+            height=34,
+            corner_radius=9,
+            command=self._start_search,
+        )
+        self.quick_search_btn.grid(row=0, column=1, padx=4, pady=10)
+
+        self.header_theme_option = ctk.CTkOptionMenu(
+            header,
+            values=["system", "light", "dark"],
+            command=self._on_theme_change,
+            width=92,
+            height=34,
+            corner_radius=9,
+        )
+        self.header_theme_option.set(getattr(self, "_saved_theme_mode", "dark"))
+        self.header_theme_option.grid(row=0, column=2, padx=(4, 4), pady=10)
+
+        self.compact_mode_var = ctk.BooleanVar(
+            value=getattr(self, "_saved_compact_mode", True)
+        )
+        self.compact_switch = ctk.CTkSwitch(
+            header,
+            text="紧凑",
+            variable=self.compact_mode_var,
+            command=self._refresh_results,
+            width=68,
+            font=ctk.CTkFont(size=11),
+        )
+        self.compact_switch.grid(row=0, column=3, padx=(4, 12), pady=10)
 
     def _build_left_panel(self, parent) -> None:
-        left = GlassFrame(parent)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        left.grid_rowconfigure(5, weight=0)
-        left.grid_rowconfigure(8, weight=1)  # Empty space for flexibility
-        left.grid_columnconfigure(0, weight=1)
+        left_wrap = GlassFrame(parent)
+        left_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        left_wrap.grid_rowconfigure(0, weight=1)
+        left_wrap.grid_columnconfigure(0, weight=1)
 
-        # 输入模式标签
+        self.left_scroll = ctk.CTkScrollableFrame(
+            left_wrap,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        self.left_scroll.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+        self.left_scroll.grid_columnconfigure(0, weight=1)
+
+        left = self.left_scroll
+
         ctk.CTkLabel(
-            left, text="🔍 搜索参数", font=ctk.CTkFont(size=14, weight="bold")
-        ).grid(row=0, column=0, sticky="w", padx=14, pady=(14, 8))
+            left, text="搜索参数", font=ctk.CTkFont(size=13, weight="bold")
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(6, 6))
 
-        # 输入字段 - 紧凑布局
+        ctk.CTkLabel(left, text="歌曲名", font=ctk.CTkFont(size=11)).grid(
+            row=1, column=0, sticky="w", padx=10, pady=(2, 2)
+        )
         self.title_entry = ctk.CTkEntry(
             left,
             textvariable=self.title_var,
-            placeholder_text="歌曲名",
-            height=36,
-            corner_radius=10,
+            height=32,
+            corner_radius=8,
         )
-        self.title_entry.grid(row=1, column=0, sticky="ew", padx=12, pady=4)
+        self.title_entry.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 6))
 
+        ctk.CTkLabel(left, text="歌手", font=ctk.CTkFont(size=11)).grid(
+            row=3, column=0, sticky="w", padx=10, pady=(2, 2)
+        )
         self.artist_entry = ctk.CTkEntry(
             left,
             textvariable=self.artist_var,
-            placeholder_text="歌手",
-            height=36,
-            corner_radius=10,
+            height=32,
+            corner_radius=8,
         )
-        self.artist_entry.grid(row=2, column=0, sticky="ew", padx=12, pady=4)
+        self.artist_entry.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 6))
 
-        album_duration = ctk.CTkFrame(left, fg_color="transparent")
-        album_duration.grid(row=3, column=0, sticky="ew", padx=12, pady=4)
-        album_duration.grid_columnconfigure((0, 1), weight=1)
-
+        ctk.CTkLabel(left, text="专辑", font=ctk.CTkFont(size=11)).grid(
+            row=5, column=0, sticky="w", padx=10, pady=(2, 2)
+        )
         self.album_entry = ctk.CTkEntry(
-            album_duration,
+            left,
             textvariable=self.album_var,
-            placeholder_text="专辑",
-            height=36,
-            corner_radius=10,
+            height=32,
+            corner_radius=8,
         )
-        self.album_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.album_entry.grid(row=6, column=0, sticky="ew", padx=10, pady=(0, 6))
 
-        self.duration_entry = ctk.CTkEntry(
-            album_duration,
-            textvariable=self.duration_var,
-            placeholder_text="时长(秒)",
-            height=36,
-            corner_radius=10,
-            width=80,
+        ctk.CTkLabel(left, text="时长(秒)", font=ctk.CTkFont(size=11)).grid(
+            row=7, column=0, sticky="w", padx=10, pady=(2, 2)
         )
-        self.duration_entry.grid(row=0, column=1, sticky="e", padx=(4, 0))
+        self.duration_entry = ctk.CTkEntry(
+            left,
+            textvariable=self.duration_var,
+            height=32,
+            corner_radius=8,
+        )
+        self.duration_entry.grid(row=8, column=0, sticky="ew", padx=10, pady=(0, 8))
+
+        self.browse_song_btn = ModernButton(
+            left,
+            text="浏览歌曲文件并搜索",
+            height=34,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            corner_radius=8,
+            command=self._browse_song_and_search,
+        )
+        self.browse_song_btn.grid(row=9, column=0, sticky="ew", padx=10, pady=(2, 8))
 
         self._bind_query_reset_handlers()
 
-        # 歌词源选择 - 紧凑网格
         ctk.CTkLabel(
-            left, text="📚 歌词源", font=ctk.CTkFont(size=12, weight="bold")
-        ).grid(row=4, column=0, sticky="w", padx=12, pady=(12, 6))
+            left, text="歌词源", font=ctk.CTkFont(size=12, weight="bold")
+        ).grid(row=10, column=0, sticky="w", padx=10, pady=(6, 4))
 
         provider_frame = ctk.CTkFrame(left, fg_color="transparent")
-        provider_frame.grid(row=5, column=0, sticky="nsew", padx=12, pady=4)
+        provider_frame.grid(row=11, column=0, sticky="nsew", padx=10, pady=2)
         provider_frame.grid_columnconfigure((0, 1), weight=1)
 
         providers = [
@@ -256,15 +310,14 @@ class LyricsFetcherGUI(ctk.CTk):
                 variable=self.provider_vars[key],
                 font=ctk.CTkFont(size=11),
             )
-            cb.grid(row=idx // 2, column=idx % 2, sticky="w", padx=4, pady=3)
+            cb.grid(row=idx // 2, column=idx % 2, sticky="w", padx=2, pady=2)
 
-        # 保存选项 - 折叠式
         ctk.CTkLabel(
-            left, text="⚙️ 保存选项", font=ctk.CTkFont(size=12, weight="bold")
-        ).grid(row=6, column=0, sticky="w", padx=12, pady=(12, 6))
+            left, text="保存选项", font=ctk.CTkFont(size=12, weight="bold")
+        ).grid(row=12, column=0, sticky="w", padx=10, pady=(8, 4))
 
         options_frame = ctk.CTkFrame(left, fg_color="transparent")
-        options_frame.grid(row=7, column=0, sticky="ew", padx=12, pady=4)
+        options_frame.grid(row=13, column=0, sticky="ew", padx=10, pady=2)
         options_frame.grid_columnconfigure(0, weight=1)
 
         ctk.CTkCheckBox(
@@ -272,80 +325,70 @@ class LyricsFetcherGUI(ctk.CTk):
             text="写入元数据",
             variable=self.include_metadata_var,
             font=ctk.CTkFont(size=10),
-        ).grid(row=0, column=0, sticky="w", pady=2)
+        ).grid(row=0, column=0, sticky="w", pady=1)
 
         ctk.CTkCheckBox(
             options_frame,
             text="去掉时间戳",
             variable=self.strip_timestamps_var,
             font=ctk.CTkFont(size=10),
-        ).grid(row=1, column=0, sticky="w", pady=2)
+        ).grid(row=1, column=0, sticky="w", pady=1)
 
         ctk.CTkCheckBox(
             options_frame,
             text="覆盖已有文件",
             variable=self.overwrite_var,
             font=ctk.CTkFont(size=10),
-        ).grid(row=2, column=0, sticky="w", pady=2)
+        ).grid(row=2, column=0, sticky="w", pady=1)
 
         ctk.CTkCheckBox(
             options_frame,
             text="自动去除翻译行",
             variable=self.strip_translation_var,
             font=ctk.CTkFont(size=10),
-        ).grid(row=3, column=0, sticky="w", pady=2)
+        ).grid(row=3, column=0, sticky="w", pady=1)
 
-        # 输出目录
         ctk.CTkLabel(
-            left, text="📁 输出目录", font=ctk.CTkFont(size=11, weight="bold")
-        ).grid(row=8, column=0, sticky="w", padx=12, pady=(12, 4))
+            left, text="输出目录", font=ctk.CTkFont(size=12, weight="bold")
+        ).grid(row=14, column=0, sticky="w", padx=10, pady=(8, 2))
+
+        ctk.CTkLabel(left, text="输出路径", font=ctk.CTkFont(size=11)).grid(
+            row=15, column=0, sticky="w", padx=10, pady=(0, 2)
+        )
 
         dir_frame = ctk.CTkFrame(left, fg_color="transparent")
-        dir_frame.grid(row=9, column=0, sticky="ew", padx=12, pady=4)
+        dir_frame.grid(row=16, column=0, sticky="ew", padx=10, pady=2)
         dir_frame.grid_columnconfigure(0, weight=1)
 
         ctk.CTkEntry(
             dir_frame,
             textvariable=self.out_dir_var,
-            placeholder_text="留空则保存到默认位置",
-            height=32,
-            corner_radius=10,
+            height=30,
+            corner_radius=8,
         ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
         ModernButton(
             dir_frame,
             text="浏览",
-            width=70,
-            height=32,
-            corner_radius=10,
+            width=66,
+            height=30,
+            corner_radius=8,
             command=self._browse_dir,
         ).grid(row=0, column=1, sticky="e")
 
-        # 浏览歌曲文件并自动搜索
-        self.browse_song_btn = ModernButton(
-            left,
-            text="🎧 浏览歌曲文件并搜索",
-            height=38,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            corner_radius=10,
-            command=self._browse_song_and_search,
-        )
-        self.browse_song_btn.grid(row=10, column=0, sticky="ew", padx=12, pady=(10, 6))
-
-        # 搜索按钮 - 主要操作
         self.search_btn = ModernButton(
             left,
-            text="🔍 搜索歌词",
-            height=44,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            corner_radius=12,
+            text="搜索歌词",
+            height=38,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            corner_radius=8,
             command=self._start_search,
         )
-        self.search_btn.grid(row=11, column=0, sticky="ew", padx=12, pady=(8, 12))
+        self.search_btn.grid(row=17, column=0, sticky="ew", padx=10, pady=(8, 10))
 
     def _build_right_panel(self, parent) -> None:
-        right = GlassFrame(parent)
-        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        right = GlassFrame(parent, bg_color=("#f8fafc", "#0d1117"))
+        right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
         right.grid_rowconfigure(1, weight=1)
         right.grid_rowconfigure(2, weight=0)
         right.grid_columnconfigure(0, weight=1)
@@ -369,8 +412,8 @@ class LyricsFetcherGUI(ctk.CTk):
         # 结果滚动框
         self.results_scroll = ctk.CTkScrollableFrame(
             right,
-            corner_radius=14,
-            fg_color=("#f3f4f6", "#1a1f2e"),
+            corner_radius=12,
+            fg_color=("#f2f4f8", "#0f1624"),
         )
         self.results_scroll.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
         self.results_scroll.grid_columnconfigure(0, weight=1)
@@ -570,22 +613,34 @@ class LyricsFetcherGUI(ctk.CTk):
     def _build_result_card(self, cand: core.LyricsCandidate, idx: int) -> None:
         """构建结果卡片"""
         selected = self.selected_candidate is cand
+        compact = (
+            bool(self.compact_mode_var.get())
+            if hasattr(self, "compact_mode_var")
+            else True
+        )
         card = GlassFrame(
             self.results_scroll,
-            bg_color=("#dbe7ff", "#17304e") if selected else ("#ffffff", "#111b28"),
+            bg_color=("#dbeafe", "#1e293b") if selected else ("#ffffff", "#111827"),
         )
-        card.grid(row=idx, column=0, sticky="ew", pady=6)
+        card.grid(row=idx, column=0, sticky="ew", pady=4 if compact else 6)
         card.grid_columnconfigure(0, weight=1)
 
         # 标题和来源
+        compact = (
+            bool(self.compact_mode_var.get())
+            if hasattr(self, "compact_mode_var")
+            else True
+        )
         header = ctk.CTkFrame(card, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
+        header.grid(
+            row=0, column=0, sticky="ew", padx=10, pady=((7 if compact else 10), 3)
+        )
         header.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
             header,
             text=cand.title or "未知",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=ctk.CTkFont(size=11 if compact else 12, weight="bold"),
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
 
@@ -610,10 +665,10 @@ class LyricsFetcherGUI(ctk.CTk):
         ctk.CTkLabel(
             card,
             text=meta,
-            font=ctk.CTkFont(size=10),
+            font=ctk.CTkFont(size=9 if compact else 10),
             text_color=("#6b7280", "#9ca3af"),
             anchor="w",
-        ).grid(row=1, column=0, sticky="w", padx=12, pady=2)
+        ).grid(row=1, column=0, sticky="w", padx=10, pady=1)
 
         # 标签
         badges = []
@@ -628,10 +683,10 @@ class LyricsFetcherGUI(ctk.CTk):
             ctk.CTkLabel(
                 card,
                 text=" | ".join(badges),
-                font=ctk.CTkFont(size=9),
+                font=ctk.CTkFont(size=8 if compact else 9),
                 text_color=("#6b7280", "#a0aac0"),
                 anchor="w",
-            ).grid(row=2, column=0, sticky="w", padx=12, pady=(4, 0))
+            ).grid(row=2, column=0, sticky="w", padx=10, pady=(2, 0))
 
         # 行为
         def select_this(refresh: bool = True):
@@ -656,16 +711,19 @@ class LyricsFetcherGUI(ctk.CTk):
             strip_timestamps=bool(self.strip_timestamps_var.get()),
             strip_translation_lines=bool(self.strip_translation_var.get()),
         )
-        snippet = "\n".join(preview_text.splitlines()[:4]).strip() or "（无歌词内容）"
+        max_lines = 2 if compact else 4
+        snippet = (
+            "\n".join(preview_text.splitlines()[:max_lines]).strip() or "（无歌词内容）"
+        )
 
         ctk.CTkLabel(
             card,
             text=snippet,
-            font=ctk.CTkFont(size=10),
+            font=ctk.CTkFont(size=9 if compact else 10),
             justify="left",
             anchor="w",
             text_color=("#475569", "#94a3b8"),
-        ).grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 10))
+        ).grid(row=3, column=0, sticky="ew", padx=10, pady=(4, 7 if compact else 10))
 
         def _on_single_click(_event=None):
             # 延迟一点执行，避免和双击事件冲突
@@ -693,7 +751,7 @@ class LyricsFetcherGUI(ctk.CTk):
             return
 
         for idx, cand in enumerate(self.current_candidates):
-            self._build_result_card(cand, idx)
+            self.after(idx * 18, lambda i=idx, c=cand: self._build_result_card(c, i))
 
     def _start_search(self) -> None:
         """启动搜索"""
@@ -824,12 +882,12 @@ class LyricsFetcherGUI(ctk.CTk):
                 break
 
             if event == "search_done":
-                self.search_btn.configure(state="normal")
+                self.search_btn.configure(state="normal", text="搜索歌词")
                 self.result_count_var.set(f"{len(self.current_candidates)} 条结果")
                 self.status_var.set("✅ 搜索完成")
                 self._refresh_results()
             elif event == "search_error":
-                self.search_btn.configure(state="normal")
+                self.search_btn.configure(state="normal", text="搜索歌词")
                 self.status_var.set(f"❌ {str(payload)}")
                 messagebox.showerror("搜索错误", str(payload))
 
@@ -954,6 +1012,21 @@ class LyricsFetcherGUI(ctk.CTk):
         self.album_entry.configure(placeholder_text="专辑")
         self.duration_entry.configure(placeholder_text="时长(秒)")
 
+    def _on_theme_change(self, mode: str) -> None:
+        try:
+            ctk.set_appearance_mode(mode)
+            self.status_var.set(f"主题：{mode}")
+            if mode == "dark":
+                self.configure(fg_color=("#f8fafb", "#0b0f14"))
+            elif mode == "light":
+                self.configure(fg_color=("#f8fafb", "#0a0e14"))
+            else:
+                self.configure(fg_color=("#f8fafb", "#0a0e14"))
+            if hasattr(self, "header_theme_option"):
+                self.header_theme_option.set(mode)
+        except Exception:
+            pass
+
     def _settings_payload(self) -> dict:
         return {
             "providers": {k: bool(v.get()) for k, v in self.provider_vars.items()},
@@ -964,6 +1037,12 @@ class LyricsFetcherGUI(ctk.CTk):
             "name_format": self.name_format_var.get(),
             "lyric_mode": self.lyric_mode_var.get(),
             "out_dir": self.out_dir_var.get(),
+            "theme_mode": self.header_theme_option.get()
+            if hasattr(self, "header_theme_option")
+            else "dark",
+            "compact_mode": bool(self.compact_mode_var.get())
+            if hasattr(self, "compact_mode_var")
+            else True,
         }
 
     def _load_settings(self) -> None:
@@ -992,6 +1071,14 @@ class LyricsFetcherGUI(ctk.CTk):
         if isinstance(data.get("out_dir"), str):
             self.out_dir_var.set(data.get("out_dir"))
 
+        theme_mode = str(data.get("theme_mode") or "dark").lower()
+        if theme_mode not in {"system", "light", "dark"}:
+            theme_mode = "dark"
+        self._saved_theme_mode = theme_mode
+
+        compact_mode = data.get("compact_mode")
+        self._saved_compact_mode = True if compact_mode is None else bool(compact_mode)
+
     def _save_settings(self) -> None:
         try:
             SETTINGS_PATH.write_text(
@@ -1000,6 +1087,14 @@ class LyricsFetcherGUI(ctk.CTk):
             )
         except Exception:
             pass
+
+    def _on_quick_search_enter(self, _event=None) -> str:
+        quick_text = self.quick_search_entry.get().strip()
+        if quick_text:
+            self.title_var.set(quick_text)
+            self.title_entry.focus_set()
+        self._start_search()
+        return "break"
 
     def _on_close(self) -> None:
         self._save_settings()
