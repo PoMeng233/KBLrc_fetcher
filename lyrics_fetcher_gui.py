@@ -766,7 +766,7 @@ class LyricsFetcherGUI(ctk.CTk):
             self._preview_candidate()
 
         def _on_single_click(_event=None):
-            card.after(120, select_this)
+            select_this()
 
         def _on_double_click(_event=None):
             open_preview()
@@ -1025,6 +1025,19 @@ class LyricsFetcherGUI(ctk.CTk):
                 if query is None:
                     query = self.current_query
 
+                # 在最终排序/去重前记录当前选中的候选“特征”，避免对象被重建后丢失选中状态
+                prev_selected = self.selected_candidate
+                prev_key = None
+                if prev_selected is not None:
+                    prev_key = (
+                        (prev_selected.source or "").strip().lower(),
+                        (prev_selected.title or "").strip().lower(),
+                        (prev_selected.artist or "").strip().lower(),
+                        (prev_selected.album or "").strip().lower(),
+                        (prev_selected.synced_lyrics or "").strip()[:160],
+                        (prev_selected.plain_lyrics or "").strip()[:160],
+                    )
+
                 if query is not None:
                     self.current_candidates = core.rank_and_deduplicate_candidates(
                         self.current_candidates, query
@@ -1034,6 +1047,25 @@ class LyricsFetcherGUI(ctk.CTk):
                         key=lambda c: getattr(c, "score", 0.0), reverse=True
                     )
 
+                # 排序/去重后恢复选中项引用，确保保存按钮使用的是当前列表中的有效对象
+                self.selected_candidate = None
+                self._selected_index = -1
+
+                if prev_selected is not None:
+                    for idx, cand in enumerate(self.current_candidates):
+                        key = (
+                            (cand.source or "").strip().lower(),
+                            (cand.title or "").strip().lower(),
+                            (cand.artist or "").strip().lower(),
+                            (cand.album or "").strip().lower(),
+                            (cand.synced_lyrics or "").strip()[:160],
+                            (cand.plain_lyrics or "").strip()[:160],
+                        )
+                        if key == prev_key:
+                            self.selected_candidate = cand
+                            self._selected_index = idx
+                            break
+
                 self.ui_queue.put(("search_done", None))
             elif event == "search_done":
                 self._is_streaming_search = False
@@ -1042,6 +1074,15 @@ class LyricsFetcherGUI(ctk.CTk):
                 self.result_count_var.set(f"{len(self.current_candidates)} 条结果")
                 self.status_var.set("✅ 搜索完成")
                 self._refresh_results()
+
+                # 若最终列表中仍有有效选中项，保持保存/预览可用
+                if self.selected_candidate is not None and self._selected_index >= 0:
+                    self.save_btn.configure(state="normal")
+                    self.preview_btn.configure(state="normal")
+                    self._update_selection_highlight()
+                else:
+                    self.save_btn.configure(state="disabled")
+                    self.preview_btn.configure(state="disabled")
             elif event == "search_error":
                 self._is_streaming_search = False
                 self.search_btn.configure(state="normal", text="搜索歌词")
