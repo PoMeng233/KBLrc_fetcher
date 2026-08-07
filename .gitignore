@@ -17,6 +17,7 @@ gui_settings.json
 .vscode/
 .idea/
 
+
 GUI_FIX_SUMMARY.md
 
 test_gui.py
