@@ -6,6 +6,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
+import '../core/app_info.dart';
 import '../core/lyrics_fetcher.dart';
 import '../core/lyrics_utils.dart';
 import '../core/models.dart';
@@ -1504,10 +1505,10 @@ class _SearchPageState extends State<SearchPage> {
                   ListTile(
                     contentPadding: EdgeInsets.zero,
                     leading: const Icon(Icons.music_note),
-                    title: const Text('KB歌词搜索'),
+                    title: const Text(appName),
                     subtitle: const Text('多源歌词下载 · Flutter Material 3'),
                     trailing: Text(
-                      'v4.0.0',
+                      'v$appVersion',
                       style: Theme.of(context).textTheme.labelLarge?.copyWith(
                         color: Theme.of(context).colorScheme.onSurfaceVariant,
                       ),
