@@ -30,24 +30,26 @@ class ResultCard extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     final color = providerColor(candidate.source);
     final textTheme = Theme.of(context).textTheme;
-    final padding = compact ? 10.0 : 14.0;
+    final padding = compact ? 11.0 : 14.0;
 
     return Card(
       elevation: selected ? 2 : 0,
       color: selected
           ? scheme.primaryContainer.withValues(alpha: 0.35)
-          : scheme.surface,
+          : scheme.surfaceContainerLow,
+      shadowColor: scheme.shadow.withValues(alpha: 0.3),
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(16),
         side: BorderSide(
-          color: selected ? scheme.primary : scheme.outlineVariant,
-          width: selected ? 2 : 1,
+          color: selected ? scheme.primary : Colors.transparent,
+          width: selected ? 1.5 : 0,
         ),
       ),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
         onTap: onTap,
         onDoubleTap: onPreview,
+        hoverColor: scheme.primary.withValues(alpha: 0.05),
         child: Padding(
           padding: EdgeInsets.all(padding),
           child: Row(
@@ -132,16 +134,14 @@ class ResultCard extends StatelessWidget {
                           ),
                         ),
                         const Spacer(),
-                        TextButton.icon(
+                        IconButton(
+                          tooltip: '预览歌词',
                           onPressed: onPreview,
-                          icon: const Icon(Icons.visibility_outlined, size: 16),
-                          label: const Text('预览'),
-                          style: TextButton.styleFrom(
-                            visualDensity: VisualDensity.compact,
-                            padding: const EdgeInsets.symmetric(horizontal: 10),
-                          ),
+                          icon: const Icon(Icons.visibility_outlined, size: 18),
+                          visualDensity: VisualDensity.compact,
+                          color: scheme.onSurfaceVariant,
                         ),
-                        const SizedBox(width: 4),
+                        const SizedBox(width: 2),
                         FilledButton.tonalIcon(
                           onPressed: onSave,
                           icon: const Icon(Icons.save_outlined, size: 16),

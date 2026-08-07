@@ -16,10 +16,18 @@ import 'widgets/preview_sheet.dart';
 import 'widgets/provider_branding.dart';
 import 'widgets/provider_chip.dart';
 import 'widgets/result_card.dart';
-import 'widgets/settings_sheet.dart';
 import 'widgets/state_views.dart';
 
 enum _DirAction { songDir, fallback, pick, cancel }
+
+enum _BatchItemStatus { running, ok, skipped, failed }
+
+class _BatchItem {
+  _BatchItem(this.file, this.status, [this.message = '']);
+  final String file;
+  final _BatchItemStatus status;
+  final String message;
+}
 
 class SearchPage extends StatefulWidget {
   const SearchPage({super.key, required this.settings});
@@ -40,6 +48,8 @@ class _SearchPageState extends State<SearchPage> {
   final _durationCtrl = TextEditingController();
   final _outDirCtrl = TextEditingController();
 
+  int _navIndex = 0;
+
   bool _searching = false;
   bool _dragActive = false;
   int _generation = 0;
@@ -49,7 +59,6 @@ class _SearchPageState extends State<SearchPage> {
   final Map<String, ProviderHealth> _health = {};
   String? _bestKey;
   LyricsCandidate? _selected;
-  String _statusMessage = '准备就绪';
   int _receivedCount = 0;
   Duration _elapsed = Duration.zero;
   Timer? _elapsedTimer;
@@ -62,9 +71,10 @@ class _SearchPageState extends State<SearchPage> {
   int _batchSuccess = 0;
   int _batchSkipped = 0;
   int _batchFailed = 0;
-  final List<String> _batchFailures = [];
+  final List<_BatchItem> _batchItems = [];
 
   bool get _busy => _searching || _batchRunning;
+  bool get _hasSelection => _selected != null && _lastQuery != null;
 
   @override
   void initState() {
@@ -132,8 +142,6 @@ class _SearchPageState extends State<SearchPage> {
       _bestKey = null;
       _receivedCount = 0;
       _elapsed = Duration.zero;
-      _statusMessage = '正在搜索：${query.title}'
-          '${query.artist.isNotEmpty ? ' / ${query.artist}' : ''}';
     });
     _elapsedTimer?.cancel();
     _elapsedTimer = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -156,13 +164,13 @@ class _SearchPageState extends State<SearchPage> {
           if (items.isNotEmpty) {
             _results.addAll(items);
             _receivedCount += items.length;
-            _statusMessage = '已收到 $_receivedCount 条结果';
           }
         });
       },
     );
 
     if (gen != _generation || !mounted) return;
+    _elapsedTimer?.cancel();
     setState(() {
       _searching = false;
       _results
@@ -171,9 +179,13 @@ class _SearchPageState extends State<SearchPage> {
       _statuses.addAll(bundle.providerStatus);
       _receivedCount = bundle.allCandidates.length;
       _bestKey = bundle.bestCandidate?.identityKey;
-      _statusMessage = bundle.allCandidates.isEmpty
-          ? '未找到歌词：${query.title}'
-          : '搜索完成，共 ${bundle.allCandidates.length} 条结果';
+      if (bundle.allCandidates.isEmpty) {
+        _showSnack(
+          '未找到歌词：${query.title}'
+          '${query.artist.isNotEmpty ? ' - ${query.artist}' : ''}',
+          isError: true,
+        );
+      }
     });
   }
 
@@ -186,7 +198,16 @@ class _SearchPageState extends State<SearchPage> {
     final result = await FilePicker.pickFiles(
       type: FileType.custom,
       allowedExtensions: [
-        'mp3', 'flac', 'm4a', 'aac', 'ogg', 'opus', 'wav', 'wma', 'ape', 'mp4',
+        'mp3',
+        'flac',
+        'm4a',
+        'aac',
+        'ogg',
+        'opus',
+        'wav',
+        'wma',
+        'ape',
+        'mp4',
       ],
     );
     if (result == null || result.files.isEmpty) return;
@@ -211,14 +232,15 @@ class _SearchPageState extends State<SearchPage> {
   }
 
   Future<void> _loadFileAndSearch(String path) async {
-    setState(() => _statusMessage = '读取音频信息：${p.basename(path)}…');
+    _showSnack('读取音频信息：${p.basename(path)}…');
     final query = await readAudioMetadata(path);
     if (!mounted) return;
     _titleCtrl.text = query.title;
     _artistCtrl.text = query.artist;
     _albumCtrl.text = query.album;
     _durationCtrl.text = query.duration?.toString() ?? '';
-    setState(() => _statusMessage = '已识别：${p.basename(path)}');
+    setState(() {});
+    _showSnack('已识别：${p.basename(path)}');
     await _runSearch(query);
   }
 
@@ -230,8 +252,9 @@ class _SearchPageState extends State<SearchPage> {
         final isDir = await FileSystemEntity.isDirectory(f.path);
         if (isDir) {
           paths.addAll(await findAudioFiles(f.path));
-        } else if (audioExtensions
-            .contains(p.extension(f.path).toLowerCase())) {
+        } else if (audioExtensions.contains(
+          p.extension(f.path).toLowerCase(),
+        )) {
           paths.add(f.path);
         }
       } catch (_) {}
@@ -281,9 +304,7 @@ class _SearchPageState extends State<SearchPage> {
       options: options,
       candidate: candidate,
       query: query,
-      policy: options.overwrite
-          ? ConflictPolicy.overwrite
-          : ConflictPolicy.ask,
+      policy: options.overwrite ? ConflictPolicy.overwrite : ConflictPolicy.ask,
     );
 
     if (outcome.conflict) {
@@ -299,14 +320,10 @@ class _SearchPageState extends State<SearchPage> {
 
     if (!mounted) return outcome;
     if (outcome.success) {
-      setState(() => _statusMessage = outcome.message);
       _showSnack(
         outcome.message,
         action: outcome.path != null && !outcome.skipped
-            ? (
-                '打开文件夹',
-                () => _openFolder(p.dirname(outcome.path!)),
-              )
+            ? ('打开文件夹', () => _openFolder(p.dirname(outcome.path!)))
             : null,
       );
     } else {
@@ -316,8 +333,9 @@ class _SearchPageState extends State<SearchPage> {
   }
 
   Future<String?> _resolveSaveDir(TrackQuery query) async {
-    final sourceDir =
-        query.sourceFile != null ? p.dirname(query.sourceFile!) : null;
+    final sourceDir = query.sourceFile != null
+        ? p.dirname(query.sourceFile!)
+        : null;
     final fallback = p.join(Directory.current.path, 'lrc_output');
     final action = await showDialog<_DirAction>(
       context: context,
@@ -423,6 +441,7 @@ class _SearchPageState extends State<SearchPage> {
   Future<void> _runBatch(List<String> files) async {
     if (_batchRunning || files.isEmpty) return;
     setState(() {
+      _navIndex = 1;
       _batchRunning = true;
       _batchCancelled = false;
       _batchTotal = files.length;
@@ -431,8 +450,7 @@ class _SearchPageState extends State<SearchPage> {
       _batchSuccess = 0;
       _batchSkipped = 0;
       _batchFailed = 0;
-      _batchFailures.clear();
-      _statusMessage = '批量处理 ${files.length} 个文件…';
+      _batchItems.clear();
     });
 
     final providers = widget.settings.enabledProviders;
@@ -447,7 +465,7 @@ class _SearchPageState extends State<SearchPage> {
       setState(() {
         _batchDone = i;
         _batchCurrent = p.basename(file);
-        _statusMessage = '批量 [${i + 1}/${files.length}] ${p.basename(file)}';
+        _batchItems.add(_BatchItem(p.basename(file), _BatchItemStatus.running));
       });
 
       try {
@@ -459,7 +477,11 @@ class _SearchPageState extends State<SearchPage> {
         );
         if (best == null) {
           _batchFailed++;
-          _batchFailures.add('${p.basename(file)}：未找到歌词');
+          _batchItems[_batchItems.length - 1] = _BatchItem(
+            p.basename(file),
+            _BatchItemStatus.failed,
+            '未找到歌词',
+          );
         } else {
           final outcome = await _saveService.save(
             options: options,
@@ -471,17 +493,36 @@ class _SearchPageState extends State<SearchPage> {
           );
           if (outcome.skipped) {
             _batchSkipped++;
+            _batchItems[_batchItems.length - 1] = _BatchItem(
+              p.basename(file),
+              _BatchItemStatus.skipped,
+              outcome.message,
+            );
           } else if (outcome.success) {
             _batchSuccess++;
+            _batchItems[_batchItems.length - 1] = _BatchItem(
+              p.basename(file),
+              _BatchItemStatus.ok,
+              outcome.message,
+            );
           } else {
             _batchFailed++;
-            _batchFailures.add('${p.basename(file)}：${outcome.message}');
+            _batchItems[_batchItems.length - 1] = _BatchItem(
+              p.basename(file),
+              _BatchItemStatus.failed,
+              outcome.message,
+            );
           }
         }
       } catch (e) {
         _batchFailed++;
-        _batchFailures.add('${p.basename(file)}：$e');
+        _batchItems[_batchItems.length - 1] = _BatchItem(
+          p.basename(file),
+          _BatchItemStatus.failed,
+          '$e',
+        );
       }
+      if (mounted) setState(() {});
     }
 
     if (!mounted) return;
@@ -490,7 +531,6 @@ class _SearchPageState extends State<SearchPage> {
       _batchRunning = false;
       _batchCurrent = '';
       _batchDone = cancelled ? _batchDone : _batchTotal;
-      _statusMessage = cancelled ? '批量处理已取消' : '批量处理完成';
     });
 
     if (!mounted) return;
@@ -506,34 +546,9 @@ class _SearchPageState extends State<SearchPage> {
             children: [
               Text('共 $_batchTotal 个文件'),
               const SizedBox(height: 8),
-              Text('✅ 成功 $_batchSuccess · ⏭ 跳过 $_batchSkipped · ❌ 失败 $_batchFailed'),
-              if (_batchFailures.isNotEmpty) ...[
-                const SizedBox(height: 12),
-                Text(
-                  '失败明细：',
-                  style: Theme.of(context).textTheme.labelLarge,
-                ),
-                const SizedBox(height: 4),
-                Flexible(
-                  child: Container(
-                    constraints: const BoxConstraints(maxHeight: 180),
-                    decoration: BoxDecoration(
-                      color: Theme.of(context)
-                          .colorScheme
-                          .surfaceContainerHighest
-                          .withValues(alpha: 0.5),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    padding: const EdgeInsets.all(8),
-                    child: SingleChildScrollView(
-                      child: Text(
-                        _batchFailures.join('\n'),
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
+              Text(
+                '✅ 成功 $_batchSuccess · ⏭ 跳过 $_batchSkipped · ❌ 失败 $_batchFailed',
+              ),
             ],
           ),
         ),
@@ -557,8 +572,7 @@ class _SearchPageState extends State<SearchPage> {
     final ok = instance != null ? await instance.checkHealth() : false;
     if (!mounted) return;
     setState(
-      () => _health[provider] =
-          ok ? ProviderHealth.ok : ProviderHealth.error,
+      () => _health[provider] = ok ? ProviderHealth.ok : ProviderHealth.error,
     );
   }
 
@@ -580,8 +594,7 @@ class _SearchPageState extends State<SearchPage> {
       SnackBar(
         content: Text(message),
         duration: const Duration(seconds: 4),
-        backgroundColor:
-            isError ? Theme.of(context).colorScheme.error : null,
+        backgroundColor: isError ? Theme.of(context).colorScheme.error : null,
         action: action != null
             ? SnackBarAction(label: action.$1, onPressed: action.$2)
             : null,
@@ -590,7 +603,7 @@ class _SearchPageState extends State<SearchPage> {
   }
 
   // ---------------------------------------------------------------------------
-  // UI
+  // 界面框架
   // ---------------------------------------------------------------------------
 
   @override
@@ -605,20 +618,35 @@ class _SearchPageState extends State<SearchPage> {
               setState(() => _dragActive = false);
               await _onDrop(details.files);
             },
-            child: Column(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                _buildHeader(),
+                _buildRail(),
+                const VerticalDivider(width: 1),
                 Expanded(
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _buildLeftPanel(),
-                      const VerticalDivider(width: 1),
-                      Expanded(child: _buildRightPanel()),
-                    ],
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 260),
+                    switchInCurve: Curves.easeOutCubic,
+                    switchOutCurve: Curves.easeInCubic,
+                    transitionBuilder: (child, animation) => FadeTransition(
+                      opacity: animation,
+                      child: SlideTransition(
+                        position: Tween(
+                          begin: const Offset(0.02, 0),
+                          end: Offset.zero,
+                        ).animate(animation),
+                        child: child,
+                      ),
+                    ),
+                    child: switch (_navIndex) {
+                      0 => _buildSearchView(key: const ValueKey('view-search')),
+                      1 => _buildBatchView(key: const ValueKey('view-batch')),
+                      _ => _buildSettingsView(
+                        key: const ValueKey('view-settings'),
+                      ),
+                    },
                   ),
                 ),
-                _buildStatusBar(),
               ],
             ),
           ),
@@ -628,73 +656,271 @@ class _SearchPageState extends State<SearchPage> {
     );
   }
 
-  Widget _buildHeader() {
+  Widget _buildRail() {
     final scheme = Theme.of(context).colorScheme;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-      decoration: BoxDecoration(
-        color: scheme.surface,
-        border: Border(bottom: BorderSide(color: scheme.outlineVariant)),
-      ),
-      child: Row(
-        children: [
-          Container(
-            width: 40,
-            height: 40,
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(12),
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [
-                  scheme.primary.withValues(alpha: 0.9),
-                  scheme.tertiary.withValues(alpha: 0.7),
-                ],
-              ),
+    return NavigationRail(
+      selectedIndex: _navIndex,
+      onDestinationSelected: (i) => setState(() => _navIndex = i),
+      labelType: NavigationRailLabelType.none,
+      backgroundColor: scheme.surface,
+      leading: Padding(
+        padding: const EdgeInsets.only(top: 14, bottom: 10),
+        child: Container(
+          width: 40,
+          height: 40,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [
+                scheme.primary.withValues(alpha: 0.9),
+                scheme.tertiary.withValues(alpha: 0.7),
+              ],
             ),
-            child: Icon(Icons.music_note, color: scheme.onPrimary, size: 22),
           ),
-          const SizedBox(width: 12),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+          child: Icon(Icons.music_note, color: scheme.onPrimary, size: 22),
+        ),
+      ),
+      destinations: [
+        NavigationRailDestination(
+          icon: const Icon(Icons.search),
+          selectedIcon: Icon(Icons.search, color: scheme.primary),
+          label: const Text('搜索'),
+        ),
+        NavigationRailDestination(
+          icon: const Icon(Icons.playlist_play),
+          selectedIcon: Icon(Icons.playlist_play, color: scheme.primary),
+          label: const Text('批量'),
+        ),
+        NavigationRailDestination(
+          icon: const Icon(Icons.tune),
+          selectedIcon: Icon(Icons.tune, color: scheme.primary),
+          label: const Text('设置'),
+        ),
+      ],
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // 搜索视图
+  // ---------------------------------------------------------------------------
+
+  Widget _buildSearchView({Key? key}) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      key: key,
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
             children: [
               Text(
-                'KB歌词搜索',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                '搜索歌词',
+                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
                   fontWeight: FontWeight.w800,
                 ),
               ),
-              Text(
-                '多源歌词下载 · v4.0.0',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: scheme.onSurfaceVariant,
+              const Spacer(),
+              if (_searching)
+                Text(
+                  '搜索中 · ${_elapsed.inSeconds}s',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.primary,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
-              ),
             ],
           ),
-          const Spacer(),
-          IconButton(
-            tooltip: '切换主题（当前：${_themeLabel(widget.settings.theme)}）',
-            icon: Icon(_themeIcon(widget.settings.theme)),
-            onPressed: () {
-              final next = switch (widget.settings.theme) {
-                ThemePreference.system => ThemePreference.light,
-                ThemePreference.light => ThemePreference.dark,
-                ThemePreference.dark => ThemePreference.system,
-              };
-              widget.settings.update(() => widget.settings.theme = next);
-            },
-          ),
-          IconButton(
-            tooltip: '设置',
-            icon: const Icon(Icons.tune),
-            onPressed: () => showModalBottomSheet<void>(
-              context: context,
-              backgroundColor: Theme.of(context).colorScheme.surface,
-              shape: const RoundedRectangleBorder(
-                borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+          const SizedBox(height: 16),
+          Flexible(
+            child: SingleChildScrollView(
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      TextField(
+                        controller: _titleCtrl,
+                        decoration: const InputDecoration(
+                          labelText: '歌曲名（必填）',
+                          hintText: '输入歌曲名，或 "歌手 - 歌名"',
+                          prefixIcon: Icon(Icons.search, size: 20),
+                        ),
+                        textInputAction: TextInputAction.next,
+                        onSubmitted: (_) => _startSearch(),
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        children: [
+                          Expanded(
+                            flex: 3,
+                            child: TextField(
+                              controller: _artistCtrl,
+                              decoration: const InputDecoration(
+                                labelText: '歌手',
+                                prefixIcon: Icon(
+                                  Icons.person_outline,
+                                  size: 20,
+                                ),
+                              ),
+                              textInputAction: TextInputAction.next,
+                              onSubmitted: (_) => _startSearch(),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            flex: 3,
+                            child: TextField(
+                              controller: _albumCtrl,
+                              decoration: const InputDecoration(
+                                labelText: '专辑',
+                                prefixIcon: Icon(
+                                  Icons.album_outlined,
+                                  size: 20,
+                                ),
+                              ),
+                              onSubmitted: (_) => _startSearch(),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          SizedBox(
+                            width: 120,
+                            child: TextField(
+                              controller: _durationCtrl,
+                              decoration: const InputDecoration(
+                                labelText: '时长(秒)',
+                                prefixIcon: Icon(
+                                  Icons.timer_outlined,
+                                  size: 20,
+                                ),
+                              ),
+                              keyboardType: TextInputType.number,
+                              onSubmitted: (_) => _startSearch(),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        '歌词源',
+                        style: Theme.of(context).textTheme.labelMedium
+                            ?.copyWith(color: scheme.onSurfaceVariant),
+                      ),
+                      const SizedBox(height: 8),
+                      SizedBox(
+                        height: 38,
+                        child: ListView(
+                          scrollDirection: Axis.horizontal,
+                          children: [
+                            for (final provider in providerCatalog.keys) ...[
+                              ProviderChip(
+                                provider: provider,
+                                enabled:
+                                    widget.settings.providers[provider] ??
+                                    false,
+                                health:
+                                    _health[provider] ?? ProviderHealth.unknown,
+                                onToggle: () {
+                                  widget.settings.update(() {
+                                    widget.settings.providers[provider] =
+                                        !(widget.settings.providers[provider] ??
+                                            false);
+                                  });
+                                  if (widget.settings.providers[provider] ??
+                                      false) {
+                                    _checkProviderHealth(provider);
+                                  }
+                                },
+                              ),
+                              const SizedBox(width: 8),
+                            ],
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: FilledButton.icon(
+                              onPressed: _busy ? null : _startSearch,
+                              style: FilledButton.styleFrom(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 14,
+                                ),
+                                textStyle: const TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              icon: _searching
+                                  ? const SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.white,
+                                      ),
+                                    )
+                                  : const Icon(Icons.search),
+                              label: Text(_searching ? '搜索中…' : '搜索歌词'),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          IconButton.filledTonal(
+                            tooltip: '浏览歌曲文件并搜索',
+                            onPressed: _busy ? null : _pickAudioFile,
+                            icon: const Icon(Icons.audio_file_outlined),
+                          ),
+                          const SizedBox(width: 8),
+                          IconButton.filledTonal(
+                            tooltip: '批量处理文件夹',
+                            onPressed: _busy ? null : _pickAudioFolder,
+                            icon: const Icon(Icons.folder_open),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Center(
+                        child: Text(
+                          '或直接把音频文件 / 文件夹拖入窗口',
+                          style: Theme.of(context).textTheme.bodySmall
+                              ?.copyWith(color: scheme.onSurfaceVariant),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ),
-              builder: (context) => SettingsSheet(settings: widget.settings),
+            ),
+          ),
+          const SizedBox(height: 16),
+          _buildResultsHeader(),
+          if (_statuses.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                for (final entry in _statuses.entries)
+                  _ProviderStatusChip(entry.key, entry.value),
+              ],
+            ),
+          ],
+          Expanded(
+            child: Stack(
+              children: [
+                Positioned.fill(child: _buildResultsArea()),
+                if (_hasSelection)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    child: _buildSelectedBar(),
+                  ),
+              ],
             ),
           ),
         ],
@@ -702,222 +928,504 @@ class _SearchPageState extends State<SearchPage> {
     );
   }
 
-  String _themeLabel(ThemePreference t) => switch (t) {
-    ThemePreference.system => '跟随系统',
-    ThemePreference.light => '浅色',
-    ThemePreference.dark => '深色',
-  };
+  Widget _buildResultsHeader() {
+    final scheme = Theme.of(context).colorScheme;
+    return Row(
+      children: [
+        Text(
+          '搜索结果',
+          style: Theme.of(
+            context,
+          ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(width: 8),
+        if (_receivedCount > 0)
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(
+              color: scheme.primaryContainer,
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Text(
+              '$_receivedCount',
+              style: TextStyle(
+                color: scheme.onPrimaryContainer,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        const Spacer(),
+        OutlinedButton.icon(
+          onPressed: _hasSelection ? () => _openPreview(_selected!) : null,
+          icon: const Icon(Icons.visibility_outlined, size: 17),
+          label: const Text('预览'),
+          style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact),
+        ),
+        const SizedBox(width: 8),
+        FilledButton.icon(
+          onPressed: _hasSelection ? () => _saveCandidate(_selected!) : null,
+          icon: const Icon(Icons.save_outlined, size: 17),
+          label: const Text('保存选中'),
+          style: FilledButton.styleFrom(visualDensity: VisualDensity.compact),
+        ),
+      ],
+    );
+  }
 
-  IconData _themeIcon(ThemePreference t) => switch (t) {
-    ThemePreference.system => Icons.brightness_auto_outlined,
-    ThemePreference.light => Icons.light_mode_outlined,
-    ThemePreference.dark => Icons.dark_mode_outlined,
-  };
-
-  Widget _buildLeftPanel() {
+  Widget _buildResultsArea() {
+    if (_searching && _results.isEmpty) {
+      return const _ShimmerList(key: ValueKey('shimmer'));
+    }
+    if (_results.isEmpty) {
+      return const EmptyState(
+        key: ValueKey('empty'),
+        icon: Icons.library_music_outlined,
+        title: '暂无搜索结果',
+        subtitle: '输入歌曲名或拖入音频文件，点击「搜索歌词」开始',
+      );
+    }
     final compact = widget.settings.compactMode;
-    final width = compact ? 360.0 : 400.0;
-    return SizedBox(
-      width: width,
+    return ListView.builder(
+      key: const ValueKey('results'),
+      padding: EdgeInsets.fromLTRB(
+        0,
+        compact ? 8 : 12,
+        0,
+        _hasSelection ? 84 : 8,
+      ),
+      itemCount: _results.length,
+      itemBuilder: (context, index) {
+        final candidate = _results[index];
+        final selected =
+            _selected != null &&
+            _selected!.identityKey == candidate.identityKey;
+        return Padding(
+          padding: EdgeInsets.only(bottom: compact ? 8 : 10),
+          child: TweenAnimationBuilder<double>(
+            key: ValueKey('anim-${candidate.identityKey}'),
+            tween: Tween(begin: 0, end: 1),
+            duration: Duration(milliseconds: 240 + (index.clamp(0, 10) * 30)),
+            curve: Curves.easeOutCubic,
+            builder: (context, t, child) => Opacity(
+              opacity: t,
+              child: Transform.translate(
+                offset: Offset(0, 18 * (1 - t)),
+                child: child,
+              ),
+            ),
+            child: ResultCard(
+              candidate: candidate,
+              selected: selected,
+              isBest: _bestKey == candidate.identityKey,
+              compact: compact,
+              onTap: () => setState(() => _selected = candidate),
+              onPreview: () => _openPreview(candidate),
+              onSave: () => _saveCandidate(candidate),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 选中结果的底部操作条（类"正在播放"栏）。
+  Widget _buildSelectedBar() {
+    final candidate = _selected!;
+    final scheme = Theme.of(context).colorScheme;
+    final color = providerColor(candidate.source);
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 240),
+      switchInCurve: Curves.easeOutCubic,
+      transitionBuilder: (child, animation) => FadeTransition(
+        opacity: animation,
+        child: SlideTransition(
+          position: Tween(
+            begin: const Offset(0, 0.4),
+            end: Offset.zero,
+          ).animate(animation),
+          child: child,
+        ),
+      ),
+      child: Container(
+        key: ValueKey('bar-${candidate.identityKey}'),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: scheme.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: scheme.outlineVariant),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.12),
+              blurRadius: 24,
+              offset: const Offset(0, 6),
+            ),
+          ],
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 38,
+              height: 38,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(11),
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [
+                    color.withValues(alpha: 0.85),
+                    color.withValues(alpha: 0.55),
+                  ],
+                ),
+              ),
+              child: Text(
+                providerShortLabel(candidate.source),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    candidate.title.isNotEmpty ? candidate.title : '未知标题',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  Text(
+                    [
+                      candidate.artist,
+                      providerLabelOf(candidate.source),
+                    ].where((s) => s.isNotEmpty).join(' · '),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            TextButton(
+              onPressed: () => _openPreview(candidate),
+              style: TextButton.styleFrom(visualDensity: VisualDensity.compact),
+              child: const Text('预览'),
+            ),
+            const SizedBox(width: 4),
+            FilledButton.tonalIcon(
+              onPressed: () => _saveCandidate(candidate),
+              style: FilledButton.styleFrom(
+                visualDensity: VisualDensity.compact,
+              ),
+              icon: const Icon(Icons.save_outlined, size: 17),
+              label: const Text('保存'),
+            ),
+            const SizedBox(width: 4),
+            IconButton(
+              tooltip: '取消选中',
+              onPressed: () => setState(() => _selected = null),
+              icon: const Icon(Icons.close, size: 18),
+              visualDensity: VisualDensity.compact,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // 批量视图
+  // ---------------------------------------------------------------------------
+
+  Widget _buildBatchView({Key? key}) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      key: key,
+      padding: const EdgeInsets.all(20),
       child: SingleChildScrollView(
-        padding: EdgeInsets.all(compact ? 12 : 16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _SectionCard(
-              title: '歌曲信息',
-              icon: Icons.library_music_outlined,
-              compact: compact,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  TextField(
-                    controller: _titleCtrl,
-                    decoration: const InputDecoration(
-                      labelText: '歌曲名 *',
-                      prefixIcon: Icon(Icons.title, size: 20),
-                    ),
-                    onSubmitted: (_) => _startSearch(),
-                    textInputAction: TextInputAction.next,
-                  ),
-                  const SizedBox(height: 10),
-                  TextField(
-                    controller: _artistCtrl,
-                    decoration: const InputDecoration(
-                      labelText: '歌手',
-                      prefixIcon: Icon(Icons.person_outline, size: 20),
-                    ),
-                    onSubmitted: (_) => _startSearch(),
-                    textInputAction: TextInputAction.next,
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      Expanded(
-                        flex: 3,
-                        child: TextField(
-                          controller: _albumCtrl,
-                          decoration: const InputDecoration(
-                            labelText: '专辑',
-                            prefixIcon: Icon(Icons.album_outlined, size: 20),
-                          ),
-                          onSubmitted: (_) => _startSearch(),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        flex: 2,
-                        child: TextField(
-                          controller: _durationCtrl,
-                          decoration: const InputDecoration(
-                            labelText: '时长(秒)',
-                            prefixIcon: Icon(Icons.timer_outlined, size: 20),
-                          ),
-                          keyboardType: TextInputType.number,
-                          onSubmitted: (_) => _startSearch(),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: _busy ? null : _pickAudioFile,
-                          icon: const Icon(Icons.audio_file_outlined, size: 18),
-                          label: const Text('浏览歌曲并搜索'),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: _busy ? null : _pickAudioFolder,
-                          icon: const Icon(Icons.folder_open, size: 18),
-                          label: const Text('批量处理文件夹'),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    '提示：可直接把音频文件或文件夹拖入窗口',
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                ],
-              ),
+            Text(
+              '批量处理',
+              style: Theme.of(
+                context,
+              ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w800),
             ),
-            const SizedBox(height: 12),
-            _SectionCard(
-              title: '歌词源',
-              icon: Icons.cloud_outlined,
-              compact: compact,
-              child: Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: [
-                  for (final provider in providerCatalog.keys)
-                    ProviderChip(
-                      provider: provider,
-                      enabled: widget.settings.providers[provider] ?? false,
-                      health: _health[provider] ?? ProviderHealth.unknown,
-                      onToggle: () {
-                        widget.settings.update(() {
-                          widget.settings.providers[provider] =
-                              !(widget.settings.providers[provider] ?? false);
-                        });
-                        if (widget.settings.providers[provider] ?? false) {
-                          _checkProviderHealth(provider);
-                        }
-                      },
+            const SizedBox(height: 16),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 32),
+                child: Column(
+                  children: [
+                    Container(
+                      width: 64,
+                      height: 64,
+                      decoration: BoxDecoration(
+                        color: scheme.primaryContainer.withValues(alpha: 0.6),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        Icons.drive_folder_upload_outlined,
+                        size: 32,
+                        color: scheme.primary,
+                      ),
                     ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 12),
-            FilledButton.icon(
-              onPressed: _busy ? null : _startSearch,
-              style: FilledButton.styleFrom(
-                padding: const EdgeInsets.symmetric(vertical: 14),
-                textStyle: const TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w700,
+                    const SizedBox(height: 14),
+                    Text(
+                      '拖入多个音频文件或文件夹',
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '自动搜索并保存每个文件的最佳歌词',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    FilledButton.tonalIcon(
+                      onPressed: _busy ? null : _pickAudioFolder,
+                      icon: const Icon(Icons.folder_open, size: 18),
+                      label: const Text('选择文件夹'),
+                    ),
+                  ],
                 ),
               ),
-              icon: _searching
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: Colors.white,
-                      ),
-                    )
-                  : const Icon(Icons.search),
-              label: Text(_searching ? '搜索中…' : '搜索歌词'),
             ),
-            const SizedBox(height: 12),
-            _SectionCard(
-              title: '保存选项',
-              icon: Icons.save_outlined,
-              compact: compact,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
+            if (_batchTotal > 0) ...[
+              const SizedBox(height: 16),
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(18),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(
+                        children: [
+                          Text(
+                            _batchRunning ? '处理中' : '处理完成',
+                            style: Theme.of(context).textTheme.titleSmall
+                                ?.copyWith(fontWeight: FontWeight.w700),
+                          ),
+                          const Spacer(),
+                          Text(
+                            '$_batchDone / $_batchTotal',
+                            style: Theme.of(context).textTheme.labelLarge
+                                ?.copyWith(color: scheme.primary),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      LinearProgressIndicator(
+                        value: _batchTotal == 0
+                            ? null
+                            : _batchDone / _batchTotal,
+                        borderRadius: BorderRadius.circular(4),
+                        minHeight: 6,
+                      ),
+                      const SizedBox(height: 10),
+                      Text(
+                        _batchCurrent.isEmpty
+                            ? '成功 $_batchSuccess · 跳过 $_batchSkipped · 失败 $_batchFailed'
+                            : _batchCurrent,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                      if (_batchRunning) ...[
+                        const SizedBox(height: 10),
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: OutlinedButton.icon(
+                            onPressed: () => _batchCancelled = true,
+                            icon: const Icon(Icons.cancel_outlined, size: 17),
+                            label: const Text('取消'),
+                            style: OutlinedButton.styleFrom(
+                              visualDensity: VisualDensity.compact,
+                            ),
+                          ),
+                        ),
+                      ],
+                      if (_batchItems.isNotEmpty) ...[
+                        const SizedBox(height: 12),
+                        ConstrainedBox(
+                          constraints: const BoxConstraints(maxHeight: 220),
+                          child: ListView.builder(
+                            shrinkWrap: true,
+                            itemCount: _batchItems.length,
+                            itemBuilder: (context, index) {
+                              final item = _batchItems[index];
+                              return _BatchItemRow(item: item);
+                            },
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // 设置视图
+  // ---------------------------------------------------------------------------
+
+  Widget _buildSettingsView({Key? key}) {
+    return Padding(
+      key: key,
+      padding: const EdgeInsets.all(20),
+      child: SingleChildScrollView(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 640),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(
+                '设置',
+                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 16),
+              _SettingsGroup(
+                title: '外观',
                 children: [
-                  _SegmentedRow(
+                  Row(
+                    children: [
+                      Text(
+                        '主题模式',
+                        style: Theme.of(context).textTheme.bodyMedium,
+                      ),
+                      const Spacer(),
+                      SegmentedButton<ThemePreference>(
+                        showSelectedIcon: false,
+                        style: const ButtonStyle(
+                          visualDensity: VisualDensity.compact,
+                        ),
+                        segments: const [
+                          ButtonSegment(
+                            value: ThemePreference.system,
+                            label: Text('跟随系统'),
+                            icon: Icon(
+                              Icons.brightness_auto_outlined,
+                              size: 16,
+                            ),
+                          ),
+                          ButtonSegment(
+                            value: ThemePreference.light,
+                            label: Text('浅色'),
+                            icon: Icon(Icons.light_mode_outlined, size: 16),
+                          ),
+                          ButtonSegment(
+                            value: ThemePreference.dark,
+                            label: Text('深色'),
+                            icon: Icon(Icons.dark_mode_outlined, size: 16),
+                          ),
+                        ],
+                        selected: {widget.settings.theme},
+                        onSelectionChanged: (s) => widget.settings.update(
+                          () => widget.settings.theme = s.first,
+                        ),
+                      ),
+                    ],
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('紧凑模式'),
+                    subtitle: const Text('缩小卡片间距，一屏显示更多结果'),
+                    secondary: const Icon(Icons.density_small),
+                    value: widget.settings.compactMode,
+                    onChanged: (v) => widget.settings.update(
+                      () => widget.settings.compactMode = v,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              _SettingsGroup(
+                title: '保存',
+                children: [
+                  _OptionRow(
                     label: '文件名格式',
-                    segments: const [
-                      ButtonSegment(
-                        value: NameFormat.file,
-                        label: Text('同名文件'),
-                        icon: Icon(Icons.description_outlined, size: 16),
+                    child: SegmentedButton<NameFormat>(
+                      showSelectedIcon: false,
+                      style: const ButtonStyle(
+                        visualDensity: VisualDensity.compact,
                       ),
-                      ButtonSegment(
-                        value: NameFormat.titleArtist,
-                        label: Text('歌名 - 歌手'),
-                        icon: Icon(Icons.title, size: 16),
+                      segments: const [
+                        ButtonSegment(
+                          value: NameFormat.file,
+                          label: Text('同名文件'),
+                          icon: Icon(Icons.description_outlined, size: 16),
+                        ),
+                        ButtonSegment(
+                          value: NameFormat.titleArtist,
+                          label: Text('歌名 - 歌手'),
+                          icon: Icon(Icons.title, size: 16),
+                        ),
+                      ],
+                      selected: {widget.settings.nameFormat},
+                      onSelectionChanged: (s) => widget.settings.update(
+                        () => widget.settings.nameFormat = s.first,
                       ),
-                    ],
-                    selected: {widget.settings.nameFormat},
-                    onChanged: (s) => widget.settings.update(
-                      () => widget.settings.nameFormat = s.first,
                     ),
                   ),
-                  const SizedBox(height: 12),
-                  _SegmentedRow(
+                  const SizedBox(height: 6),
+                  _OptionRow(
                     label: '歌词模式',
-                    segments: const [
-                      ButtonSegment(
-                        value: LyricMode.auto,
-                        label: Text('自动'),
-                        icon: Icon(Icons.auto_awesome, size: 16),
+                    child: SegmentedButton<LyricMode>(
+                      showSelectedIcon: false,
+                      style: const ButtonStyle(
+                        visualDensity: VisualDensity.compact,
                       ),
-                      ButtonSegment(
-                        value: LyricMode.synced,
-                        label: Text('时间轴'),
-                        icon: Icon(Icons.timer_outlined, size: 16),
+                      segments: const [
+                        ButtonSegment(
+                          value: LyricMode.auto,
+                          label: Text('自动'),
+                          icon: Icon(Icons.auto_awesome, size: 16),
+                        ),
+                        ButtonSegment(
+                          value: LyricMode.synced,
+                          label: Text('时间轴'),
+                          icon: Icon(Icons.timer_outlined, size: 16),
+                        ),
+                        ButtonSegment(
+                          value: LyricMode.plain,
+                          label: Text('纯文本'),
+                          icon: Icon(Icons.text_fields, size: 16),
+                        ),
+                      ],
+                      selected: {widget.settings.lyricMode},
+                      onSelectionChanged: (s) => widget.settings.update(
+                        () => widget.settings.lyricMode = s.first,
                       ),
-                      ButtonSegment(
-                        value: LyricMode.plain,
-                        label: Text('纯文本'),
-                        icon: Icon(Icons.text_fields, size: 16),
-                      ),
-                    ],
-                    selected: {widget.settings.lyricMode},
-                    onChanged: (s) => widget.settings.update(
-                      () => widget.settings.lyricMode = s.first,
                     ),
                   ),
-                  const SizedBox(height: 12),
+                  const SizedBox(height: 10),
                   Row(
                     children: [
                       Expanded(
                         child: TextField(
                           controller: _outDirCtrl,
                           decoration: const InputDecoration(
-                            labelText: '输出目录（留空=歌曲目录）',
+                            labelText: '输出目录（留空 = 保存到歌曲目录）',
                             isDense: true,
                             prefixIcon: Icon(Icons.folder_outlined, size: 20),
                           ),
@@ -949,248 +1457,67 @@ class _SearchPageState extends State<SearchPage> {
                   ),
                   SwitchListTile(
                     contentPadding: EdgeInsets.zero,
-                    dense: true,
                     title: const Text('覆盖已有文件'),
+                    subtitle: const Text('关闭时遇到同名文件会询问'),
+                    secondary: const Icon(Icons.sync_alt),
                     value: widget.settings.overwrite,
-                    onChanged: (v) =>
-                        widget.settings.update(() => widget.settings.overwrite = v),
+                    onChanged: (v) => widget.settings.update(
+                      () => widget.settings.overwrite = v,
+                    ),
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('写入元数据头'),
+                    subtitle: const Text('在 LRC 文件头写入 [ti]/[ar]/[al]/[by]'),
+                    secondary: const Icon(Icons.info_outline),
+                    value: widget.settings.includeMetadata,
+                    onChanged: (v) => widget.settings.update(
+                      () => widget.settings.includeMetadata = v,
+                    ),
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('保存时去掉时间戳'),
+                    subtitle: const Text('输出纯文本歌词'),
+                    secondary: const Icon(Icons.timer_off_outlined),
+                    value: widget.settings.stripTimestamps,
+                    onChanged: (v) => widget.settings.update(
+                      () => widget.settings.stripTimestamps = v,
+                    ),
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('去掉翻译行'),
+                    subtitle: const Text('保存时移除翻译歌词行'),
+                    secondary: const Icon(Icons.translate),
+                    value: widget.settings.stripTranslation,
+                    onChanged: (v) => widget.settings.update(
+                      () => widget.settings.stripTranslation = v,
+                    ),
                   ),
                 ],
               ),
-            ),
-            if (_batchRunning) ...[
-              const SizedBox(height: 12),
-              _SectionCard(
-                title: '批量处理',
-                icon: Icons.playlist_play,
-                compact: compact,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    LinearProgressIndicator(
-                      value: _batchTotal == 0 ? null : _batchDone / _batchTotal,
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      '[$_batchDone/$_batchTotal] $_batchCurrent',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      '成功 $_batchSuccess · 跳过 $_batchSkipped · 失败 $_batchFailed',
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              const SizedBox(height: 14),
+              _SettingsGroup(
+                title: '关于',
+                children: [
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.music_note),
+                    title: const Text('KB歌词搜索'),
+                    subtitle: const Text('多源歌词下载 · Flutter Material 3'),
+                    trailing: Text(
+                      'v4.0.0',
+                      style: Theme.of(context).textTheme.labelLarge?.copyWith(
                         color: Theme.of(context).colorScheme.onSurfaceVariant,
                       ),
                     ),
-                    const SizedBox(height: 8),
-                    OutlinedButton.icon(
-                      onPressed: () => _batchCancelled = true,
-                      icon: const Icon(Icons.cancel_outlined, size: 18),
-                      label: const Text('取消批量处理'),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildRightPanel() {
-    final scheme = Theme.of(context).colorScheme;
-    final compact = widget.settings.compactMode;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Padding(
-          padding: EdgeInsets.fromLTRB(
-            compact ? 12 : 20,
-            compact ? 10 : 14,
-            compact ? 12 : 20,
-            0,
-          ),
-          child: Row(
-            children: [
-              Text(
-                '搜索结果',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-              const SizedBox(width: 8),
-              if (_receivedCount > 0)
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 2,
                   ),
-                  decoration: BoxDecoration(
-                    color: scheme.primaryContainer,
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                  child: Text(
-                    '$_receivedCount',
-                    style: TextStyle(
-                      color: scheme.onPrimaryContainer,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                ),
-              const Spacer(),
-              OutlinedButton.icon(
-                onPressed: _hasSelection ? () => _openPreview(_selected!) : null,
-                icon: const Icon(Icons.visibility_outlined, size: 18),
-                label: const Text('预览'),
-              ),
-              const SizedBox(width: 8),
-              FilledButton.icon(
-                onPressed: _hasSelection
-                    ? () => _saveCandidate(_selected!)
-                    : null,
-                icon: const Icon(Icons.save_outlined, size: 18),
-                label: const Text('保存选中'),
+                ],
               ),
             ],
           ),
         ),
-        if (_statuses.isNotEmpty)
-          Padding(
-            padding: EdgeInsets.fromLTRB(
-              compact ? 12 : 20,
-              10,
-              compact ? 12 : 20,
-              4,
-            ),
-            child: Wrap(
-              spacing: 6,
-              runSpacing: 6,
-              children: [
-                for (final entry in _statuses.entries)
-                  _ProviderStatusChip(entry.key, entry.value),
-              ],
-            ),
-          ),
-        if (_searching) ...[
-          const SizedBox(height: 4),
-          Padding(
-            padding: EdgeInsets.symmetric(horizontal: compact ? 12 : 20),
-            child: LinearProgressIndicator(
-              minHeight: 2,
-              borderRadius: BorderRadius.circular(2),
-            ),
-          ),
-        ],
-        Expanded(
-          child: AnimatedSwitcher(
-            duration: const Duration(milliseconds: 240),
-            child: _buildResultsArea(),
-          ),
-        ),
-      ],
-    );
-  }
-
-  bool get _hasSelection => _selected != null && _lastQuery != null;
-
-  Widget _buildResultsArea() {
-    if (_searching && _results.isEmpty) {
-      return const _ShimmerList(key: ValueKey('shimmer'));
-    }
-    if (_results.isEmpty) {
-      return const EmptyState(
-        key: ValueKey('empty'),
-        icon: Icons.library_music_outlined,
-        title: '暂无搜索结果',
-        subtitle: '输入歌曲名或拖入音频文件，点击「搜索歌词」开始',
-      );
-    }
-    final compact = widget.settings.compactMode;
-    return ListView.builder(
-      key: const ValueKey('results'),
-      padding: EdgeInsets.all(compact ? 8 : 14),
-      itemCount: _results.length,
-      itemBuilder: (context, index) {
-        final candidate = _results[index];
-        final selected =
-            _selected != null && _selected!.identityKey == candidate.identityKey;
-        return Padding(
-          padding: EdgeInsets.only(bottom: compact ? 8 : 10),
-          child: TweenAnimationBuilder<double>(
-            key: ValueKey('anim-${candidate.identityKey}'),
-            tween: Tween(begin: 0, end: 1),
-            duration: Duration(
-              milliseconds: 240 + (index.clamp(0, 10) * 30),
-            ),
-            curve: Curves.easeOutCubic,
-            builder: (context, t, child) => Opacity(
-              opacity: t,
-              child: Transform.translate(
-                offset: Offset(0, 18 * (1 - t)),
-                child: child,
-              ),
-            ),
-            child: ResultCard(
-              candidate: candidate,
-              selected: selected,
-              isBest: _bestKey == candidate.identityKey,
-              compact: compact,
-              onTap: () => setState(() => _selected = candidate),
-              onPreview: () => _openPreview(candidate),
-              onSave: () => _saveCandidate(candidate),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildStatusBar() {
-    final scheme = Theme.of(context).colorScheme;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
-      decoration: BoxDecoration(
-        color: scheme.surface,
-        border: Border(top: BorderSide(color: scheme.outlineVariant)),
-      ),
-      child: Row(
-        children: [
-          Icon(
-            _statusMessage.startsWith('✅') || _statusMessage.startsWith('已保存')
-                ? Icons.check_circle_outline
-                : _statusMessage.startsWith('❌') ||
-                        _statusMessage.startsWith('未找到')
-                ? Icons.error_outline
-                : _busy
-                ? Icons.hourglass_top
-                : Icons.info_outline,
-            size: 15,
-            color: scheme.onSurfaceVariant,
-          ),
-          const SizedBox(width: 6),
-          Expanded(
-            child: Text(
-              _statusMessage,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: scheme.onSurfaceVariant,
-              ),
-            ),
-          ),
-          if (_searching)
-            Text(
-              '耗时 ${_elapsed.inSeconds}s',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: scheme.onSurfaceVariant,
-              ),
-            ),
-        ],
       ),
     );
   }
@@ -1198,19 +1525,19 @@ class _SearchPageState extends State<SearchPage> {
   Widget _buildDragOverlay() {
     final scheme = Theme.of(context).colorScheme;
     return Positioned.fill(
-      child: Container(
-        color: scheme.primaryContainer.withValues(alpha: 0.25),
+      child: ColoredBox(
+        color: scheme.scrim.withValues(alpha: 0.25),
         child: Center(
           child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 28),
+            padding: const EdgeInsets.symmetric(horizontal: 44, vertical: 30),
             decoration: BoxDecoration(
               color: scheme.surface,
               borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: scheme.primary, width: 2),
+              border: Border.all(color: scheme.primary, width: 1.5),
               boxShadow: [
                 BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.15),
-                  blurRadius: 30,
+                  color: Colors.black.withValues(alpha: 0.2),
+                  blurRadius: 40,
                 ),
               ],
             ),
@@ -1219,7 +1546,7 @@ class _SearchPageState extends State<SearchPage> {
               children: [
                 Icon(
                   Icons.file_download_outlined,
-                  size: 48,
+                  size: 44,
                   color: scheme.primary,
                 ),
                 const SizedBox(height: 12),
@@ -1231,7 +1558,7 @@ class _SearchPageState extends State<SearchPage> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  '单个音频文件将自动搜索，多个文件或文件夹将批量处理',
+                  '单个文件自动搜索 · 多个文件或文件夹批量处理',
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
                     color: scheme.onSurfaceVariant,
                   ),
@@ -1245,88 +1572,108 @@ class _SearchPageState extends State<SearchPage> {
   }
 }
 
-class _SectionCard extends StatelessWidget {
-  const _SectionCard({
-    required this.title,
-    required this.icon,
-    required this.compact,
-    required this.child,
-  });
+// -----------------------------------------------------------------------------
+// 小组件
+// -----------------------------------------------------------------------------
+
+class _SettingsGroup extends StatelessWidget {
+  const _SettingsGroup({required this.title, required this.children});
 
   final String title;
-  final IconData icon;
-  final bool compact;
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Card(
-      child: Padding(
-        padding: EdgeInsets.all(compact ? 12 : 14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(icon, size: 17, color: scheme.primary),
-                const SizedBox(width: 6),
-                Text(
-                  title,
-                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                    color: scheme.primary,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            child,
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _SegmentedRow<T> extends StatelessWidget {
-  const _SegmentedRow({
-    required this.label,
-    required this.segments,
-    required this.selected,
-    required this.onChanged,
-  });
-
-  final String label;
-  final List<ButtonSegment<T>> segments;
-  final Set<T> selected;
-  final ValueChanged<Set<T>> onChanged;
+  final List<Widget> children;
 
   @override
   Widget build(BuildContext context) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          label,
-          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-            color: Theme.of(context).colorScheme.onSurfaceVariant,
-          ),
-        ),
-        const SizedBox(height: 6),
-        SizedBox(
-          width: double.infinity,
-          child: SegmentedButton<T>(
-            segments: segments,
-            selected: selected,
-            onSelectionChanged: onChanged,
-            showSelectedIcon: false,
-            style: const ButtonStyle(
-              visualDensity: VisualDensity.compact,
+        Padding(
+          padding: const EdgeInsets.only(left: 4, bottom: 8),
+          child: Text(
+            title,
+            style: Theme.of(context).textTheme.labelLarge?.copyWith(
+              color: Theme.of(context).colorScheme.primary,
+              fontWeight: FontWeight.w700,
             ),
           ),
         ),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(children: children),
+          ),
+        ),
       ],
+    );
+  }
+}
+
+class _OptionRow extends StatelessWidget {
+  const _OptionRow({required this.label, required this.child});
+
+  final String label;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 100,
+          child: Text(label, style: Theme.of(context).textTheme.bodyMedium),
+        ),
+        const Spacer(),
+        child,
+      ],
+    );
+  }
+}
+
+/// 批量列表项。
+class _BatchItemRow extends StatelessWidget {
+  const _BatchItemRow({required this.item});
+
+  final _BatchItem item;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final (IconData, Color) icon = switch (item.status) {
+      _BatchItemStatus.running => (Icons.hourglass_top, scheme.primary),
+      _BatchItemStatus.ok => (Icons.check_circle, Colors.green),
+      _BatchItemStatus.skipped => (Icons.skip_next, Colors.orange),
+      _BatchItemStatus.failed => (Icons.error_outline, scheme.error),
+    };
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        children: [
+          Icon(icon.$1, size: 15, color: icon.$2),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              item.file,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ),
+          if (item.message.isNotEmpty &&
+              item.status != _BatchItemStatus.running)
+            Flexible(
+              child: Text(
+                item.message,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.end,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                  fontSize: 11,
+                ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 }
@@ -1362,9 +1709,9 @@ class _ProviderStatusChip extends StatelessWidget {
           Text(
             '${providerLabelOf(provider)}'
             '${status.resultCount > 0 ? ' ${status.resultCount}' : ''}',
-            style: Theme.of(context).textTheme.labelSmall?.copyWith(
-              color: scheme.onSurfaceVariant,
-            ),
+            style: Theme.of(
+              context,
+            ).textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
           ),
         ],
       ),
@@ -1399,7 +1746,7 @@ class _ShimmerListState extends State<_ShimmerList>
     return FadeTransition(
       opacity: Tween(begin: 0.45, end: 1.0).animate(_controller),
       child: ListView.builder(
-        padding: const EdgeInsets.all(14),
+        padding: const EdgeInsets.only(top: 12),
         itemCount: 4,
         itemBuilder: (context, index) => Container(
           height: 96,
@@ -1407,7 +1754,7 @@ class _ShimmerListState extends State<_ShimmerList>
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
             color: scheme.surfaceContainerHighest.withValues(alpha: 0.6),
-            borderRadius: BorderRadius.circular(14),
+            borderRadius: BorderRadius.circular(16),
           ),
           child: Row(
             children: [
