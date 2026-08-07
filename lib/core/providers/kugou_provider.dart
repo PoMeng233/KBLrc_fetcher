@@ -40,8 +40,12 @@ class KugouProvider implements LyricsProvider {
     final results = <LyricsCandidate>[];
 
     for (final (title, artist) in query.searchVariants) {
-      final keyword = '$artist - $title'.replaceAll(RegExp(r'^\s+|\s+$'), '').trimLeft().trimRight();
-      if (keyword == '-' || keyword.isEmpty) continue;
+      // 与 Python 版 strip(" -") 等价：去掉两端空白与连字符
+      var keyword = '$artist - $title';
+      keyword = keyword
+          .replaceFirst(RegExp(r'^[\s-]+'), '')
+          .replaceFirst(RegExp(r'[\s-]+$'), '');
+      if (keyword.isEmpty) continue;
 
       final songs = <Map<String, dynamic>>[];
 
