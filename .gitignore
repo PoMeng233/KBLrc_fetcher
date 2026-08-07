@@ -1,27 +1,38 @@
+# --- Python 遗留（legacy/） ---
 __pycache__/
-
-
 .venv/
 venv/
 env/
+*.log
+*.tmp
+gui_settings.json
+GUI_FIX_SUMMARY.md
+test_gui.py
+LyricsFetcher.spec
+KBlrc_fetcher.spec
+legacy/build/
+legacy/dist/
+legacy/release/
 
+# --- Flutter/Dart ---
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.iml
 build/
 dist/
 release/
 
-*.log
-*.tmp
+# --- 生成文件 ---
+windows/flutter/ephemeral/
+windows/flutter/generated_plugin_registrant.cc
+windows/flutter/generated_plugin_registrant.h
+windows/flutter/generated_plugins.cmake
 
-gui_settings.json
-
+# --- IDE ---
 .vscode/
 .idea/
 
-
-GUI_FIX_SUMMARY.md
-
-test_gui.py
-
-GUI_FIX_SUMMARY.md
-
-LyricsFetcher.spec
+# --- 系统 ---
+.DS_Store
+Thumbs.db
