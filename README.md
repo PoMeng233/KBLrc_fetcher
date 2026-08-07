@@ -33,20 +33,29 @@
 - Visual Studio 2022 Build Tools，需包含：
   - **使用 C++ 的桌面开发** 工作负载
   - **Windows 11 SDK** 组件（缺失时 `flutter build windows` 会报
-    `Unable to find suitable Visual Studio toolchain`）
+    `Unable to find suitable Visual Studio toolchain`；可用 VS Installer 执行
+    `setup.exe modify --installPath "<VS安装路径>" --add Microsoft.VisualStudio.Component.Windows11SDK.26100 --quiet --norestart` 补装）
 
 ## 运行（开发模式）
 
+> ⚠️ 本项目路径 `G:\カラオケ\...` 含非 ASCII 字符，Flutter 的 Windows 构建链
+> （cmd → MSBuild）会把路径转成 GBK 导致乱码报错（`锟斤拷` / 自定义生成退出码 255）。
+> 已建立目录联接 `G:\kblrc_build` → 本项目，**所有构建/运行请走联接路径**：
+
 ```powershell
-D:\flutter\flutter\bin\flutter run -d windows
+D:\flutter\flutter\bin\flutter run -d windows   # 在 G:\kblrc_build 下执行
 ```
 
 ## 构建发布版
 
 ```powershell
+cd G:\kblrc_build
 D:\flutter\flutter\bin\flutter build windows --release
-# 产物在 build\windows\x64\runner\Release\
+# 产物在 build\windows\x64\runner\Release\（lyrics_fetcher.exe + data\app.so）
 ```
+
+快速启动验证：`powershell -ExecutionPolicy Bypass -File tools\smoke_run.ps1`
+（启动 6 秒无崩溃则输出 `RUNNING_OK`）
 
 ## 测试
 
