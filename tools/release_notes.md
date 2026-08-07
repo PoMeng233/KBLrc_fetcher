@@ -1,4 +1,4 @@
-## KB歌词搜索 v4.0.0 — Flutter Material 3 重构版
+## KB歌词搜索 v4.0.1 — Flutter Material 3 重构版
 
 从 Python (customtkinter) 完全重写为 Flutter Windows 桌面应用，UI 与性能全面升级。
 
@@ -13,7 +13,7 @@
 
 ### 安装
 
-下载 `lyrics_fetcher_windows_x64_4.0.0.zip` 解压后运行 `lyrics_fetcher.exe`。
+下载 `lyrics_fetcher_windows_x64_4.0.1.zip` 解压后运行 `lyrics_fetcher.exe`。
 
 ### 注意
 

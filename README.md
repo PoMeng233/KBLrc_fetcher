@@ -14,7 +14,7 @@
 - **两种搜索方式**：
   - 手动输入歌曲名/歌手/专辑/时长
   - 选择音频文件 → 自动读取元数据（标题/歌手/专辑/时长）并搜索
-- **批量处理**：选择文件夹或拖入多个文件，自动为每首歌保存最佳歌词（带进度与取消）
+- **批量处理**：选择文件夹或拖入多个文件，自动为每首歌保存最佳歌词（逐文件进度、可取消）
 - **拖拽支持**：把音频文件或文件夹直接拖入窗口
 - **歌词预览**：时间轴配色高亮、一键切换 自动/时间轴/纯文本、元数据/去时间戳/去翻译
 - **智能保存**：
@@ -33,34 +33,61 @@
 - Visual Studio 2022 Build Tools，需包含：
   - **使用 C++ 的桌面开发** 工作负载
   - **Windows 11 SDK** 组件（缺失时 `flutter build windows` 会报
-    `Unable to find suitable Visual Studio toolchain`；可用 VS Installer 执行
-    `setup.exe modify --installPath "<VS安装路径>" --add Microsoft.VisualStudio.Component.Windows11SDK.26100 --quiet --norestart` 补装）
+    `Unable to find suitable Visual Studio toolchain`，可用 VS Installer 补装：
+
+    ```powershell
+    setup.exe modify --installPath "<VS 安装路径>" `
+      --add Microsoft.VisualStudio.Component.Windows11SDK.26100 --quiet --norestart
+    ```
+
+    其中 `<VS 安装路径>` 例如 `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`）
 
 ## 运行（开发模式）
 
-> ⚠️ 本项目路径 `G:\カラオケ\...` 含非 ASCII 字符，Flutter 的 Windows 构建链
-> （cmd → MSBuild）会把路径转成 GBK 导致乱码报错（`锟斤拷` / 自定义生成退出码 255）。
-> 已建立目录联接 `G:\kblrc_build` → 本项目，**所有构建/运行请走联接路径**：
-
-```powershell
-D:\flutter\flutter\bin\flutter run -d windows   # 在 G:\kblrc_build 下执行
+```bash
+flutter pub get
+flutter run -d windows
 ```
 
 ## 构建发布版
 
-```powershell
-cd G:\kblrc_build
-D:\flutter\flutter\bin\flutter build windows --release
+```bash
+flutter build windows --release
 # 产物在 build\windows\x64\runner\Release\（lyrics_fetcher.exe + data\app.so）
 ```
 
-快速启动验证：`powershell -ExecutionPolicy Bypass -File tools\smoke_run.ps1`
-（启动 6 秒无崩溃则输出 `RUNNING_OK`）
+发布打包（自动生成 zip）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\package_release.ps1
+# 可指定版本：-Version 4.0.1
+```
+
+快速启动验证：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\smoke_run.ps1
+# 启动 6 秒无崩溃则输出 RUNNING_OK
+```
+
+## 注意：非 ASCII 路径
+
+Windows 下 Flutter 的构建链（cmd → MSBuild）在项目路径含非 ASCII 字符（如中文、日文）时
+会把路径转成 GBK 导致乱码报错（如 `锟斤拷`、自定义生成退出码 255）。若遇到此问题：
+
+- 将项目放到纯 ASCII 路径下构建/运行；或
+- 用目录联接（junction）映射一个 ASCII 路径：
+
+```powershell
+New-Item -ItemType Junction -Path C:\kblrc_build -Target "C:\...\lyrics_fetcher"
+cd C:\kblrc_build
+flutter run -d windows        # 或 flutter build windows --release
+```
 
 ## 测试
 
-```powershell
-D:\flutter\flutter\bin\flutter test
+```bash
+flutter test
 ```
 
 ## 目录结构
@@ -76,11 +103,15 @@ lib/
     providers/             # 6 个歌词源实现 + HTTP 基础设施
   ui/
     app.dart               # MaterialApp + Material 3 主题
-    search_page.dart       # 主界面（搜索/批量/拖拽/保存流程）
-    widgets/               # 结果卡片、预览、设置面板等组件
+    search_page.dart       # 主界面（搜索/批量/设置 三视图 + 拖拽/保存流程）
+    widgets/               # 结果卡片、预览、歌词源开关等组件
 test/
   core_test.dart           # 核心逻辑单元测试
   app_smoke_test.dart      # 应用启动冒烟测试
+tools/
+  package_release.ps1      # 发布打包脚本
+  smoke_run.ps1            # 启动验证脚本
+  release_notes.md         # 发布说明模板
 legacy/                    # 旧版 Python 实现（仅归档参考）
 ```
 

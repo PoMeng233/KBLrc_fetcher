@@ -1,10 +1,17 @@
+# 发布打包脚本：把 release 产物打包为 zip。
+# 用法：powershell -ExecutionPolicy Bypass -File tools\package_release.ps1 [-Version 4.0.1]
+param(
+  [string]$Version = '4.0.1'
+)
+
 $ErrorActionPreference = 'Stop'
-$releaseDir = 'G:\kblrc_build\build\windows\x64\runner\Release'
-$staging = 'G:\kblrc_build\build\kblrc_package'
-$zip = 'G:\kblrc_build\build\lyrics_fetcher_windows_x64_4.0.0.zip'
+$projectRoot = Split-Path -Parent $PSScriptRoot
+$releaseDir = Join-Path $projectRoot 'build\windows\x64\runner\Release'
+$staging = Join-Path $projectRoot 'build\kblrc_package'
+$zip = Join-Path $projectRoot "build\lyrics_fetcher_windows_x64_$Version.zip"
 
 if (-not (Test-Path (Join-Path $releaseDir 'lyrics_fetcher.exe'))) {
-  Write-Error 'release exe not found'
+  Write-Error "未找到 release 产物：$releaseDir`n请先执行 flutter build windows --release"
 }
 
 # 重建干净的打包目录
@@ -17,9 +24,9 @@ Get-ChildItem -Path $releaseDir | ForEach-Object {
 }
 
 # 附带说明
-$readme = @'
-KB歌词搜索 v4.0.0
-=================
+$readme = @"
+KB歌词搜索 v$Version
+====================
 多源歌词搜索下载工具（Flutter Material 3 / Windows x64）
 
 歌词源：LRCLIB、Lyrics.ovh、酷狗、酷我、网易云、QQ 音乐
@@ -33,7 +40,7 @@ KB歌词搜索 v4.0.0
 说明：
   - 首次运行会自动创建设置；歌词默认保存到歌曲所在目录
   - 如被杀毒软件误报，请添加信任（应用无任何网络之外的系统权限）
-'@
+"@
 Set-Content -Path (Join-Path $staging '使用说明.txt') -Value $readme -Encoding UTF8
 
 # 打包 zip
